@@ -23,17 +23,23 @@ char* makeRef() {
     return ref;
 }
 
-char** makeFrag(char* ref) {
-    char** frags = (char**)malloc(fragNum * sizeof(char*));     // 조각들을 저장하기 위한 2차원 배열을 동적으로 할당
+char** makeFrag() {
+    // A, T, C, G 염기를 배열로 정의
+    char bases[4] = {'A', 'T', 'C', 'G'};
+    
+    // 조각들을 저장하기 위한 2차원 배열 동적 할당
+    char** frags = (char**)malloc(fragNum * sizeof(char*)); 
 
     for (int i = 0; i < fragNum; i++) {
-        frags[i] = (char*)malloc((fragLength + 1) * sizeof(char));     // 각 조각을 저장하기 위한 배열 동적 할당 (+1은 문자열 종료 문자 '\0'를 위해)
+        // 각 조각을 저장하기 위한 배열 동적 할당 (+1은 '\0' 자리를 위함)
+        frags[i] = (char*)malloc((fragLength + 1) * sizeof(char)); 
 
-        int startIndex = rand() % (refLength - fragLength + 1);     // 원본 염기서열에서 조각을 시작할 랜덤한 인덱스 생성
         for (int j = 0; j < fragLength; j++) {
-            frags[i][j] = ref[startIndex + j];     // 원본 염기서열에서 조각을 추출하여 frags 배열에 저장
+            // 0, 1, 2, 3 중 랜덤한 인덱스를 뽑아 A, T, C, G 중 하나를 무작위 선택
+            int index = rand() % 4; 
+            frags[i][j] = bases[index]; 
         }
-        frags[i][fragLength] = '\0';      // 문자열 종료 문자 추가
+        frags[i][fragLength] = '\0'; // 문자열 종료 문자 추가
     }
 
     return frags;
