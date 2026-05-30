@@ -6,13 +6,13 @@
 // ===== 데이터 생성 파라미터 =====
 // refLength(원본 길이)만 바꾸면 리드 길이/개수가 커버리지에 맞춰 자동 조정됩니다.
 // (권장: refLength >= 400. 너무 작으면 fragLength가 K_MER보다 작아져 동작 불가)
-#define refLength    1000                                  // 원본 게놈 길이 (N)
+#define refLength    100000                                  // 원본 게놈 길이 (N)
 #define COVERAGE     30                                    // 목표 커버리지 (배수)
 #define fragLength   (refLength / 20)                      // 리드 길이 (L) = 원본의 1/20, 자동
 #define fragNum      ((refLength * COVERAGE) / fragLength) // 리드 개수 (M) = 커버리지 유지, 자동
 
 // ===== 알고리즘 파라미터 =====
-#define K_MER        8                                     // k-mer 길이 (시드 특이성)
+#define K_MER        10                                     // k-mer 길이 (시드 특이성)
 #define HASH_SIZE    (1 << (K_MER * 2))                    // 해시 테이블 크기 (4^K)
 #define MIN_OVERLAP  (fragLength / 2)                      // 조립 시 인정할 최소 겹침 길이
 #define MAX_MISMATCH 2                                     // 겹침 검사 시 허용 미스매치 수
