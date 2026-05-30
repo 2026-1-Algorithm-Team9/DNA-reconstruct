@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "preIndex_core.h"
 
@@ -268,4 +269,206 @@ void printTopSeeds(MaxHeap* heap, int topN) {
                candidate.frequency);
     }
     printf("\n");
+}
+
+// ===============================================================
+// 메모리 사용량 측정 (malloc 크기 합산, 간단 방식)
+// ===============================================================
+size_t countingIndexMemory(const CountingIndex* index) {
+    if (index == NULL) return 0;
+
+    size_t bytes = sizeof(CountingIndex);
+    bytes += (size_t)HASH_SIZE * sizeof(int);                     // countArray
+    bytes += (size_t)(HASH_SIZE + 1) * sizeof(int);              // prefixStart
+    bytes += (size_t)HASH_SIZE * sizeof(int);                     // prefixEnd
+    bytes += (size_t)index->totalKmers * sizeof(KmerOccurrence);  // occurrences
+    return bytes;
+}
+
+size_t maxHeapMemory(const MaxHeap* heap) {
+    if (heap == NULL) return 0;
+    return sizeof(MaxHeap) + (size_t)heap->capacity * sizeof(SeedCandidate);
+}
+
+// ===============================================================
+// 5단계: 우선순위 기반 조립 (Seed-and-Extend, de novo)
+// ===============================================================
+
+// 두 조각의 오버랩 구간을 비교하며 mismatch 수를 센다 (조기 종료)
+int checkOverlapWithMismatch(const char* readSign, const char* targetRead, int overlapLen, int maxMismatch) {
+    int mismatches = 0;
+    for (int i = 0; i < overlapLen; i++) {
+        if (readSign[i] != targetRead[i]) {
+            mismatches++;
+            if (mismatches > maxMismatch) return -1;   // 허용치 초과 시 즉시 실패
+        }
+    }
+    return mismatches;
+}
+
+// MaxHeap의 고빈도 시드를 시작점으로, CountingIndex를 활용해 양방향으로 조각을 이어붙인다.
+char* assembleReads(const CountingIndex* index, const MaxHeap* heap, char** frags, int maxMismatch) {
+    if (heap->size == 0) return NULL;
+
+    // 모든 조각이 일렬로 붙어도 넘치지 않을 만큼 큰 임시 버퍼 확보
+    int maxPossibleLen = fragNum * fragLength * 2 + 1;
+    char* tempBuffer = (char*)calloc(maxPossibleLen, sizeof(char));
+    if (tempBuffer == NULL) return NULL;
+
+    // 양방향 확장을 위해 시작 포인터를 버퍼 정중앙에 위치시킴
+    int centerPos = maxPossibleLen / 2;
+    char* assembledStart = tempBuffer + centerPos;
+
+    // 가장 빈도 높은 1등 시드가 들어있는 첫 조각을 조립 시작점으로 선정
+    int topHash = heap->data[0].hash;
+    int startReadIdx = 0;
+    if (index->prefixStart[topHash] < index->prefixEnd[topHash]) {
+        startReadIdx = index->occurrences[index->prefixStart[topHash]].readIndex;
+    }
+
+    strcpy(assembledStart, frags[startReadIdx]);
+    int assembledLen = (int)strlen(assembledStart);
+
+    int* used = (int*)calloc(fragNum, sizeof(int));   // 중복 조립 방지용
+    if (used != NULL) used[startReadIdx] = 1;
+
+    // ---------- [방향 1] 오른쪽(뒤) 확장 ----------
+    int progress = 1;
+    while (progress) {
+        progress = 0;
+        int bestFragIdx = -1;
+        int bestOverlap = 0;
+
+        if (assembledLen >= K_MER) {
+            // 현재 조립 서열의 끝 K_MER 글자를 해시로 변환
+            char* tailKmerPtr = assembledStart + assembledLen - K_MER;
+            int tailHash = 0;
+            for (int j = 0; j < K_MER; j++)
+                tailHash = (tailHash << 2) | charToBit(tailKmerPtr[j]);
+
+            // 같은 끝 K_MER를 품은 후보 조각만 인덱스로 빠르게 추려서 검사
+            int pStart = index->prefixStart[tailHash];
+            int pEnd = index->prefixEnd[tailHash];
+            for (int p = pStart; p < pEnd; p++) {
+                int i = index->occurrences[p].readIndex;
+                if (used && used[i]) continue;
+
+                char* target = frags[i];
+                // 오버랩 길이를 길게(fragLength)부터 줄여가며 가장 길게 겹치는 지점 탐색
+                for (int len = fragLength; len >= MIN_OVERLAP; len--) {
+                    if (assembledLen < len) continue;
+                    char* assembledTail = assembledStart + assembledLen - len;
+                    int mismatch = checkOverlapWithMismatch(assembledTail, target, len, maxMismatch);
+                    if (mismatch != -1) {
+                        if (len > bestOverlap) { bestOverlap = len; bestFragIdx = i; }
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (bestFragIdx != -1 && bestOverlap > 0) {
+            if (used) used[bestFragIdx] = 1;
+            if ((assembledStart - tempBuffer) + assembledLen + (fragLength - bestOverlap) < maxPossibleLen) {
+                strcat(assembledStart, frags[bestFragIdx] + bestOverlap);  // 겹친 뒤 꼬리만 결합
+                assembledLen = (int)strlen(assembledStart);
+                progress = 1;
+            } else break;
+        }
+    }
+
+    // ---------- [방향 2] 왼쪽(앞) 확장 ----------
+    progress = 1;
+    while (progress) {
+        progress = 0;
+        int bestFragIdx = -1;
+        int bestOverlap = 0;
+
+        if (assembledLen >= K_MER) {
+            // 현재 조립 서열의 앞 K_MER 글자를 해시로 변환
+            int headHash = 0;
+            for (int j = 0; j < K_MER; j++)
+                headHash = (headHash << 2) | charToBit(assembledStart[j]);
+
+            int pStart = index->prefixStart[headHash];
+            int pEnd = index->prefixEnd[headHash];
+            for (int p = pStart; p < pEnd; p++) {
+                int i = index->occurrences[p].readIndex;
+                if (used && used[i]) continue;
+
+                char* target = frags[i];
+                for (int len = fragLength; len >= MIN_OVERLAP; len--) {
+                    if (assembledLen < len) continue;
+                    char* targetTail = target + fragLength - len;   // 후보 조각의 뒤쪽 len 글자
+                    int mismatch = checkOverlapWithMismatch(targetTail, assembledStart, len, maxMismatch);
+                    if (mismatch != -1) {
+                        if (len > bestOverlap) { bestOverlap = len; bestFragIdx = i; }
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (bestFragIdx != -1 && bestOverlap > 0) {
+            if (used) used[bestFragIdx] = 1;
+            int addLen = fragLength - bestOverlap;
+            if (assembledStart - tempBuffer >= addLen) {
+                assembledStart -= addLen;                            // 시작 포인터를 왼쪽으로 이동
+                strncpy(assembledStart, frags[bestFragIdx], addLen); // 새로 확보된 앞 공간 채우기
+                assembledLen += addLen;
+                progress = 1;
+            } else break;
+        }
+    }
+
+    // 완성된 조립 서열만 떼어내 새 메모리에 복사
+    char* finalAssembled = (char*)calloc(assembledLen + 1, sizeof(char));
+    if (finalAssembled != NULL) {
+        strncpy(finalAssembled, assembledStart, assembledLen);
+        finalAssembled[assembledLen] = '\0';
+    }
+
+    if (used) free(used);
+    free(tempBuffer);
+    return finalAssembled;
+}
+
+// ===============================================================
+// 성능 리포트: 정확도(최적 오프셋 정렬) + 속도 + 메모리
+// ===============================================================
+void printPerformanceReport(const char* originalRef, const char* assembledRef, double duration, size_t memoryBytes) {
+    if (originalRef == NULL || assembledRef == NULL) return;
+
+    int N = (int)strlen(originalRef);
+    int A = (int)strlen(assembledRef);
+
+    // [정확도 측정] de novo 조립은 시작 위치/길이가 원본과 어긋나기 때문에
+    // 0번부터 단순 비교하면 실력을 과소평가한다. 그래서 assembled를 original 위에서
+    // 한 칸씩 밀어가며(offset) 일치 글자 수가 최대가 되는 위치를 찾아 그 값으로 채점한다.
+    int bestMatches = 0;
+    int bestOffset = 0;
+    for (int d = -(A - 1); d <= N - 1; d++) {
+        int matches = 0;
+        for (int i = 0; i < A; i++) {
+            int j = i + d;
+            if (j >= 0 && j < N && assembledRef[i] == originalRef[j]) matches++;
+        }
+        if (matches > bestMatches) { bestMatches = matches; bestOffset = d; }
+    }
+
+    double accuracy = (N > 0) ? (100.0 * bestMatches / N) : 0.0;
+
+    printf("\n================ [성능 분석 리포트] ================\n");
+    printf("[정확도] 원본 복원율 : %.2f %% (%d / %d bp, 최적 오프셋 %d)\n",
+           accuracy, bestMatches, N, bestOffset);
+    printf("[속도]   알고리즘 시간: %.6f 초\n", duration);
+    printf("[메모리] 사용량      : %zu bytes (%.2f KB)\n",
+           memoryBytes, memoryBytes / 1024.0);
+    printf("----------------------------------------------------\n");
+    printf("원본 길이: %d | 조립 길이: %d\n", N, A);
+    if (N <= 200) {
+        printf("원본: %s\n", originalRef);
+        printf("조립: %s\n", assembledRef);
+    }
+    printf("====================================================\n");
 }
