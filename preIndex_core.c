@@ -434,6 +434,132 @@ char* assembleReads(const CountingIndex* index, const MaxHeap* heap, char** frag
 }
 
 // ===============================================================
+// 5단계+: De Bruijn 그래프 기반 Consensus 조립 (에러 내성)
+// ---------------------------------------------------------------
+// 단순 greedy는 "리드를 통째로 이어붙여" 에러가 있으면 시드/겹침이 깨져
+// 조립이 끊긴다. 여기서는 리드를 작은 k-mer(DBG_K)로 잘게 쪼개 그래프로 본다.
+//
+//   원리(커버리지로 에러를 이긴다):
+//     - 올바른 k-mer는 여러 리드에 반복 등장 → 빈도 높음.
+//     - 에러난 k-mer는 한두 번만 등장 → 빈도 낮음(DBG_MIN_FREQ 이하).
+//     => 저빈도 k-mer를 버리면 '에러가 자동으로 걸러진' k-mer 집합이 남는다.
+//
+//   조립:
+//     - k-mer 두 개가 (k-1)글자만큼 겹치면 한 글자씩 이어진다(De Bruijn 간선).
+//     - 고빈도 시작 k-mer에서 출발해, 다음 글자(A/C/G/T) 중 빈도가 가장 높은
+//       k-mer로 한 칸씩 전진하며 서열을 늘린다(= 위치별 다수결 consensus).
+//     - 양방향(오른쪽/왼쪽)으로 확장해 원본을 복원한다.
+// ===============================================================
+
+// DBG_K 길이 k-mer 빈도표 생성 (리드를 슬라이딩하며 카운트). 에러 필터의 기반.
+static int* buildDbgFreq(char** frags) {
+    int* freq = (int*)calloc((size_t)DBG_HASH_SIZE, sizeof(int));
+    if (freq == NULL) return NULL;
+    int cut = (1 << (DBG_K * 2)) - 1;
+
+    for (int i = 0; i < fragNum; i++) {
+        char* read = frags[i];
+        int h = 0;
+        for (int j = 0; j < DBG_K; j++)
+            h = (h << 2) | charToBit(read[j]);
+        freq[h]++;
+        for (int j = DBG_K; j < fragLength; j++) {
+            h = ((h << 2) | charToBit(read[j])) & cut;
+            freq[h]++;
+        }
+    }
+    return freq;
+}
+
+// 현재 k-mer(curHash)의 뒤에 A/C/G/T를 붙여 만든 4개의 다음 k-mer 중
+// 빈도가 가장 높은(>=DBG_MIN_FREQ) 것을 선택. 반환: 추가된 염기 비트(0~3), 없으면 -1.
+static int bestNext(const int* freq, int curHash, int cut) {
+    int bestBase = -1, bestFreq = DBG_MIN_FREQ;   // 임계값 이하(에러)는 무시
+    for (int b = 0; b < 4; b++) {
+        int nextHash = ((curHash << 2) | b) & cut;
+        if (freq[nextHash] > bestFreq) { bestFreq = freq[nextHash]; bestBase = b; }
+    }
+    return bestBase;
+}
+
+// 현재 k-mer(curHash)의 앞에 A/C/G/T를 붙여 만든 4개의 이전 k-mer 중 최고 빈도 선택.
+static int bestPrev(const int* freq, int curHash, int highBitShift) {
+    int bestBase = -1, bestFreq = DBG_MIN_FREQ;
+    for (int b = 0; b < 4; b++) {
+        int prevHash = (curHash >> 2) | (b << highBitShift);
+        if (freq[prevHash] > bestFreq) { bestFreq = freq[prevHash]; bestBase = b; }
+    }
+    return bestBase;
+}
+
+char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** frags, int maxMismatch) {
+    (void)index; (void)heap; (void)maxMismatch;   // 이 방식은 DBG_K 빈도표만 사용
+
+    int* freq = buildDbgFreq(frags);
+    if (freq == NULL) return NULL;
+    int cut = (1 << (DBG_K * 2)) - 1;
+    int highBitShift = (DBG_K - 1) * 2;            // 앞쪽 염기를 끼울 비트 위치
+
+    // 시작점: 빈도가 가장 높은 k-mer (가장 신뢰도 높은 지점에서 조립 시작)
+    int seedHash = 0, seedFreq = -1;
+    for (int h = 0; h < DBG_HASH_SIZE; h++) {
+        if (freq[h] > seedFreq) { seedFreq = freq[h]; seedHash = h; }
+    }
+    if (seedFreq < DBG_MIN_FREQ) { free(freq); return NULL; }   // 쓸만한 k-mer 없음
+
+    // 결과 버퍼: 양방향 확장을 위해 정중앙에서 시작
+    int maxLen = refLength * 2 + fragLength + 16;   // 원본보다 넉넉히
+    char* buf = (char*)calloc((size_t)maxLen, 1);
+    if (buf == NULL) { free(freq); return NULL; }
+    int center = maxLen / 2;
+    char* start = buf + center;
+
+    // 방문한 k-mer 재방문 방지(반복서열에서 무한루프 차단)
+    char* visited = (char*)calloc((size_t)DBG_HASH_SIZE, 1);
+
+    // 시드 k-mer를 가운데에 펼쳐 적기
+    char seedStr[DBG_K + 1];
+    { int h = seedHash; for (int i = DBG_K - 1; i >= 0; i--) { seedStr[i] = "ACGT"[h & 3]; h >>= 2; } seedStr[DBG_K] = '\0'; }
+    memcpy(start, seedStr, DBG_K);
+    int len = DBG_K;
+    if (visited) visited[seedHash] = 1;
+
+    // ---------- 오른쪽 확장 ----------
+    int curHash = seedHash;
+    while ((start - buf) + len < maxLen - 1) {
+        int b = bestNext(freq, curHash, cut);
+        if (b < 0) break;
+        int nextHash = ((curHash << 2) | b) & cut;
+        if (visited && visited[nextHash]) break;     // 반복 진입 차단
+        start[len++] = "ACGT"[b];
+        curHash = nextHash;
+        if (visited) visited[nextHash] = 1;
+    }
+
+    // ---------- 왼쪽 확장 ----------
+    curHash = seedHash;
+    while (start - buf > 1) {
+        int b = bestPrev(freq, curHash, highBitShift);
+        if (b < 0) break;
+        int prevHash = (curHash >> 2) | (b << highBitShift);
+        if (visited && visited[prevHash]) break;
+        start--; len++;
+        start[0] = "ACGT"[b];
+        curHash = prevHash;
+        if (visited) visited[prevHash] = 1;
+    }
+
+    char* result = (char*)malloc((size_t)len + 1);
+    if (result) { memcpy(result, start, len); result[len] = '\0'; }
+
+    if (visited) free(visited);
+    free(buf);
+    free(freq);
+    return result;
+}
+
+
+// ===============================================================
 // 성능 리포트: 정확도(최적 오프셋 정렬) + 속도 + 메모리
 // ===============================================================
 void printPerformanceReport(const char* originalRef, const char* assembledRef, double duration, size_t memoryBytes) {

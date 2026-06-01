@@ -30,26 +30,59 @@ char* makeRef() {
     return ref;
 }
 
-char** makeFrag(char* ref) {
+// 한 염기를 자신과 다른 3개 중 하나로 무작위 치환 (= 미스매치 1개 발생)
+static char mutateBase(char original) {
+    char basis[4] = {'A', 'C', 'G', 'T'};
+    char c;
+    do {
+        c = basis[rand() % 4];
+    } while (c == original);
+    return c;
+}
+
+char** makeFrag(char* ref, int* outInjectedErrors) {
     char** frags = (char**)malloc(fragNum * sizeof(char*));
     if (frags == NULL) return NULL;
+
+    int injected = 0;
 
     for (int i = 0; i < fragNum; i++) {
         frags[i] = (char*)malloc((fragLength + 1) * sizeof(char));
 
         int startIndex = bigRand() % (refLength - fragLength + 1);   // 원본에서 랜덤 시작 위치 (OS 무관)
         for (int j = 0; j < fragLength; j++) {
-            frags[i][j] = ref[startIndex + j];                    // 원본의 substring을 그대로 떼옴
+            char base = ref[startIndex + j];                         // 원본의 substring을 떼옴
+
+            // ERROR_RATE_PERCENT 확률로 시퀀싱 에러(미스매치) 주입
+            if (ERROR_RATE_PERCENT > 0 && (rand() % 100) < ERROR_RATE_PERCENT) {
+                base = mutateBase(base);
+                injected++;
+            }
+            frags[i][j] = base;
         }
         frags[i][fragLength] = '\0';
     }
 
+    if (outInjectedErrors != NULL) *outInjectedErrors = injected;
     return frags;
 }
 
+// 메모리 사용량 합산 (malloc 기준 간단 측정)
+static size_t calcMemory(const CountingIndex* idx, const MaxHeap* heap, size_t assembledLen) {
+    size_t bytes = 0;
+    bytes += countingIndexMemory(idx);
+    bytes += maxHeapMemory(heap);
+    bytes += (size_t)fragNum * sizeof(char*) + (size_t)fragNum * (fragLength + 1);  // 리드
+    bytes += (size_t)(refLength + 1);                                               // 원본
+    bytes += (size_t)(fragNum * fragLength * 2 + 1);                                // 조립 임시버퍼(peak)
+    bytes += assembledLen + 1;                                                      // 결과 서열
+    return bytes;
+}
+
 int main(void) {
+    int injectedErrors = 0;
     char* ref = makeRef();
-    char** frags = (ref != NULL) ? makeFrag(ref) : NULL;
+    char** frags = (ref != NULL) ? makeFrag(ref, &injectedErrors) : NULL;
 
     if (ref == NULL || frags == NULL) {
         printf("초기 데이터 생성에 실패했습니다.\n");
@@ -58,29 +91,21 @@ int main(void) {
         return 1;
     }
 
+    long totalBases = (long)fragNum * fragLength;
     printf("=== 데이터 생성 파라미터 ===\n");
-    printf("원본 길이(N): %d | 리드 길이(L): %d | 리드 개수(M): %d | 커버리지: %.1f배 | K-mer: %d\n\n",
+    printf("원본 길이(N): %d | 리드 길이(L): %d | 리드 개수(M): %d | 커버리지: %.1f배 | K-mer: %d\n",
            refLength, fragLength, fragNum,
            (double)(fragNum * fragLength) / refLength, K_MER);
+    printf("에러율 설정: %d%% | 실제 주입된 미스매치: %d개 / %ld bp (%.2f%%)\n\n",
+           ERROR_RATE_PERCENT, injectedErrors, totalBases,
+           totalBases > 0 ? (100.0 * injectedErrors / totalBases) : 0.0);
 
-    // ===== 알고리즘 시작 (시간 측정 구간: 데이터 생성/출력은 제외) =====
-    clock_t start = clock();
-
+    // 공통 전처리: 인덱스 + 힙
     CountingIndex* countingIndex = buildCountingIndex(frags);
     MaxHeap* seedHeap = (countingIndex != NULL) ? buildSeedHeap(countingIndex) : NULL;
 
-    char* assembled = NULL;
-    if (countingIndex != NULL && seedHeap != NULL) {
-        assembled = assembleReads(countingIndex, seedHeap, frags, MAX_MISMATCH);
-    }
-
-    clock_t end = clock();
-    double duration = (double)(end - start) / CLOCKS_PER_SEC;
-    // ===== 알고리즘 끝 =====
-
-    if (countingIndex == NULL || seedHeap == NULL || assembled == NULL) {
-        printf("알고리즘 수행에 실패했습니다.\n");
-        free(assembled);
+    if (countingIndex == NULL || seedHeap == NULL) {
+        printf("인덱스/힙 생성에 실패했습니다.\n");
         freeMaxHeap(seedHeap);
         freeCountingIndex(countingIndex);
         for (int i = 0; i < fragNum; i++) free(frags[i]);
@@ -89,26 +114,30 @@ int main(void) {
         return 1;
     }
 
-    // 메모리 사용량 합산 (malloc 기준 간단 측정 = 공간복잡도 근사치)
-    size_t memoryBytes = 0;
-    memoryBytes += countingIndexMemory(countingIndex);                                 // 인덱스
-    memoryBytes += maxHeapMemory(seedHeap);                                            // 힙
-    memoryBytes += (size_t)fragNum * sizeof(char*) + (size_t)fragNum * (fragLength + 1); // 리드 조각들
-    memoryBytes += (size_t)(refLength + 1);                                            // 원본 서열
-    memoryBytes += (size_t)(fragNum * fragLength * 2 + 1);                             // 조립 임시 버퍼(peak)
-    memoryBytes += strlen(assembled) + 1;                                              // 최종 조립 서열
-
-    // 상위 시드 표시 (데이터가 작을 때만 상세 인덱스까지 출력)
-    if (fragNum <= 12) {
-        printCountingIndex(countingIndex, frags);
-    }
     printTopSeeds(seedHeap, 5);
 
-    // 5단계 결과 + 성능 리포트 (정확도/속도/메모리)
-    printPerformanceReport(ref, assembled, duration, memoryBytes);
+    // ===== [방식 1] 기존 greedy 조립 (벤치마크) =====
+    clock_t s1 = clock();
+    char* greedy = assembleReads(countingIndex, seedHeap, frags, MAX_MISMATCH);
+    double t1 = (double)(clock() - s1) / CLOCKS_PER_SEC;
+
+    // ===== [방식 2] Consensus 보정 조립 (우리 개선안) =====
+    clock_t s2 = clock();
+    char* consensus = assembleConsensus(countingIndex, seedHeap, frags, MAX_MISMATCH);
+    double t2 = (double)(clock() - s2) / CLOCKS_PER_SEC;
+
+    if (greedy != NULL) {
+        printf("########## [방식 1] 기존 Greedy 조립 ##########");
+        printPerformanceReport(ref, greedy, t1, calcMemory(countingIndex, seedHeap, strlen(greedy)));
+    }
+    if (consensus != NULL) {
+        printf("\n########## [방식 2] Consensus(다수결 투표) 보정 조립 ##########");
+        printPerformanceReport(ref, consensus, t2, calcMemory(countingIndex, seedHeap, strlen(consensus)));
+    }
 
     // 메모리 해제
-    free(assembled);
+    free(consensus);
+    free(greedy);
     freeMaxHeap(seedHeap);
     freeCountingIndex(countingIndex);
     for (int i = 0; i < fragNum; i++) free(frags[i]);
