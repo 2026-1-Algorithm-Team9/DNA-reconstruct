@@ -451,13 +451,6 @@ char* assembleReads(const CountingIndex* index, const MaxHeap* heap, char** frag
 //     - 양방향(오른쪽/왼쪽)으로 확장해 원본을 복원한다.
 // ===============================================================
 
-// qsort로 k-mer 해시를 빈도 내림차순 정렬하기 위한 비교 함수와 빈도표 포인터.
-int* dbgFreqForSort = NULL;
-int dbgCompareByFreq(const void* a, const void* b) {
-    int ha = *(const int*)a, hb = *(const int*)b;
-    return dbgFreqForSort[hb] - dbgFreqForSort[ha];   // 높은 빈도가 앞으로
-}
-
 // DBG_K 길이 k-mer 빈도표 생성 (리드를 슬라이딩하며 카운트). 에러 필터의 기반.
 static int* buildDbgFreq(char** frags) {
     int* freq = (int*)calloc((size_t)DBG_HASH_SIZE, sizeof(int));
@@ -476,6 +469,31 @@ static int* buildDbgFreq(char** frags) {
         }
     }
     return freq;
+}
+
+// [변형 A] DBG_K 빈도표로부터 Max Heap을 구성한다.
+// 4단계에서 쓰던 MaxHeap/SeedCandidate 자료구조와 heapifyUp을 그대로 재사용해,
+// "가장 신뢰도(빈도) 높은 k-mer를 우선순위 큐로 관리"하는 4단계의 역할을
+// 5단계 조립의 시작점 선택에 직접 연결한다. (1~5단계 파이프라인 일관성 확보)
+// seedList: 실제 등장한 k-mer 해시 목록, seedCount: 그 개수.
+static MaxHeap* buildSeedHeapFromFreq(const int* freq, const int* seedList, int seedCount) {
+    MaxHeap* heap = (MaxHeap*)malloc(sizeof(MaxHeap));
+    if (heap == NULL) return NULL;
+
+    heap->data = (SeedCandidate*)malloc((size_t)(seedCount > 0 ? seedCount : 1) * sizeof(SeedCandidate));
+    heap->size = 0;
+    heap->capacity = seedCount;
+    if (heap->data == NULL) { free(heap); return NULL; }
+
+    // 등장한 k-mer만 힙에 삽입 (DBG_HASH_SIZE 전체가 아니라 실제 등장분만 → 효율적)
+    for (int i = 0; i < seedCount; i++) {
+        int h = seedList[i];
+        heap->data[heap->size].hash = h;
+        heap->data[heap->size].frequency = freq[h];
+        heapifyUp(heap, heap->size);   // 4단계의 heapifyUp 재사용
+        heap->size++;
+    }
+    return heap;
 }
 
 // 현재 k-mer(curHash)의 뒤에 A/C/G/T를 붙여 만든 4개의 다음 k-mer 중
@@ -499,9 +517,9 @@ static int bestPrev(const int* freq, int curHash, int highBitShift) {
     return bestBase;
 }
 
-// 시드 k-mer 하나에서 양방향으로 확장해 contig 하나를 만든다.
-// visited는 호출 간 공유되어 같은 k-mer를 두 번 조립하지 않게 한다(여러 contig 분리).
-// 반환: 새로 malloc된 contig 문자열(호출자가 free), 길이는 *outLen.
+// 시드 k-mer 하나에서 양방향으로 greedy 확장해 contig 하나를 만든다.
+// 매 칸 가장 빈도 높은 다음 k-mer로 전진(=위치별 다수결). visited는 반복서열에서의
+// 무한루프 차단용. 한 번 방문한 k-mer를 다시 만나면 멈춘다.
 static char* growContig(const int* freq, int seedHash, char* visited, int* outLen) {
     int cut = (1 << (DBG_K * 2)) - 1;
     int highBitShift = (DBG_K - 1) * 2;
@@ -511,18 +529,17 @@ static char* growContig(const int* freq, int seedHash, char* visited, int* outLe
     if (buf == NULL) { *outLen = 0; return NULL; }
     char* start = buf + maxLen / 2;
 
-    // 시드를 가운데에 적기
     { int h = seedHash; for (int i = DBG_K - 1; i >= 0; i--) { start[i] = "ACGT"[h & 3]; h >>= 2; } }
     int len = DBG_K;
     visited[seedHash] = 1;
 
-    // 오른쪽 확장: 다음 글자 후보 중 최고 빈도(>=DBG_MIN_FREQ)로 한 칸씩 전진
+    // 오른쪽 확장
     int curHash = seedHash;
     while ((start - buf) + len < maxLen - 1) {
         int b = bestNext(freq, curHash, cut);
         if (b < 0) break;
         int nextHash = ((curHash << 2) | b) & cut;
-        if (visited[nextHash]) break;                 // 이미 다른 contig가 쓴 구간 → 멈춤
+        if (visited[nextHash]) break;
         start[len++] = "ACGT"[b];
         curHash = nextHash;
         visited[nextHash] = 1;
@@ -587,22 +604,25 @@ char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** 
         }
         if (seen) free(seen);
     }
-    // 빈도 내림차순 정렬(간단 삽입정렬은 느리므로 qsort 대신 freq 비교 선택정렬 대체:
-    // 여기서는 빈도 높은 시드부터 쓰면 충분하므로 qsort 사용)
-    // qsort 비교를 위해 freq 전역 접근이 필요 → 정적 포인터로 전달
-    extern int dbgCompareByFreq(const void*, const void*);
-    dbgFreqForSort = freq;
-    qsort(seedList, seedCount, sizeof(int), dbgCompareByFreq);
+    // [변형 A] 4단계 Max Heap 자료구조로 시드 우선순위를 관리한다.
+    // 기존엔 qsort로 전체 정렬했지만, "신뢰도(빈도) 높은 시드부터 하나씩 꺼내는"
+    // 우리 용도엔 Max Heap(extractMax)이 자료구조적으로 더 적합하다.
+    // 이로써 4단계(Max Heap)가 5단계(조립 시작점 선택)에 실제로 연결된다.
+    MaxHeap* seedHeap = buildSeedHeapFromFreq(freq, seedList, seedCount);
+    free(seedList);
+    if (seedHeap == NULL) { free(visited); free(freq); return NULL; }
 
-    // [1] 빈도 높은 시드부터 contig를 확장해 수집한다.
+    // [1] Max Heap에서 신뢰도 높은 시드부터 추출해 contig를 확장·수집한다.
     const int MAX_CONTIGS = 256;
     char** contigs = (char**)malloc(MAX_CONTIGS * sizeof(char*));
     int* clens = (int*)malloc(MAX_CONTIGS * sizeof(int));
     int nContigs = 0;
 
-    for (int s = 0; s < seedCount && nContigs < MAX_CONTIGS; s++) {
-        int seedHash = seedList[s];
-        if (visited[seedHash]) continue;        // 이미 다른 contig가 흡수한 시드
+    while (nContigs < MAX_CONTIGS && seedHeap->size > 0) {
+        SeedCandidate top = extractMax(seedHeap);   // 4단계 extractMax 재사용
+        int seedHash = top.hash;
+        if (seedHash < 0) break;
+        if (visited[seedHash]) continue;            // 이미 다른 contig가 흡수한 시드
 
         int len = 0;
         char* contig = growContig(freq, seedHash, visited, &len);
@@ -616,7 +636,7 @@ char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** 
         }
     }
 
-    free(seedList);
+    freeMaxHeap(seedHeap);   // 4단계 freeMaxHeap 재사용
     free(visited);
     free(freq);
 
