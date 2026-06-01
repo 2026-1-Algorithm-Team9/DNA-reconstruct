@@ -575,6 +575,41 @@ static int contigOverlap(const char* a, int aLen, const char* b, int bLen) {
     return 0;
 }
 
+// [리드 다리 병합용] 문자열 hay 안에서 길이 needleLen인 needle이 처음 나오는 위치.
+// 못 찾으면 -1. (작은 데이터라 단순 검색으로 충분)
+static int findSub(const char* hay, int hayLen, const char* needle, int needleLen) {
+    if (needleLen <= 0 || needleLen > hayLen) return -1;
+    for (int i = 0; i <= hayLen - needleLen; i++)
+        if (memcmp(hay + i, needle, needleLen) == 0) return i;
+    return -1;
+}
+
+// 리드 다리(read bridging): contig A의 '끝'과 contig B의 '시작'을 동시에 품은
+// 원본 리드를 찾아, 그 리드의 중간 구간(틈)으로 A와 B를 한 줄로 잇는다.
+// 커버리지 구멍으로 그래프가 끊겨 겹침 병합이 안 될 때, 틈을 가로지르는 리드로 메운다.
+//
+// aTail: A의 마지막 ANCHOR글자, bHead: B의 처음 ANCHOR글자.
+// 성공 시 A와 B 사이에 들어갈 '연결 구간(리드에서 aTail 끝 ~ bHead 시작 사이)'을
+// gapOut에 복사하고 그 길이를 반환. 실패 시 -1.
+// (A의 aTail과 B의 bHead는 결과에 이미 있으므로 그 사이만 채우면 됨)
+static int findBridge(char** frags, const char* aTail, const char* bHead,
+                      int anchor, char* gapOut, int gapCap) {
+    for (int r = 0; r < fragNum; r++) {
+        char* read = frags[r];
+        int posA = findSub(read, fragLength, aTail, anchor);
+        if (posA < 0) continue;
+        int afterA = posA + anchor;                       // 리드에서 aTail 바로 뒤
+        int posB = findSub(read + afterA, fragLength - afterA, bHead, anchor);
+        if (posB < 0) continue;                            // 같은 리드에 B 시작이 뒤따라 나오나
+        posB += afterA;                                    // 리드 내 절대 위치로 보정
+        int gapLen = posB - afterA;                        // A끝과 B시작 사이 틈 길이
+        if (gapLen < 0 || gapLen >= gapCap) continue;
+        if (gapLen > 0) memcpy(gapOut, read + afterA, gapLen);
+        return gapLen;                                     // 0이면 A끝과 B시작이 바로 붙음
+    }
+    return -1;
+}
+
 char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** frags, int maxMismatch) {
     (void)index; (void)heap; (void)maxMismatch;   // 이 방식은 DBG_K 빈도표만 사용
 
@@ -656,7 +691,9 @@ char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** 
     char* mergedFlag = (char*)calloc(nContigs, 1);
     mergedFlag[bestIdx] = 1;
 
-    // 더 이상 붙일 게 없을 때까지 반복: 남은 contig 중 결과와 겹치는 것을 찾아 결합
+    // 더 이상 붙일 게 없을 때까지 반복: 겹침 병합 + 리드 다리 병합을 함께 시도.
+    int anchor = DBG_K;                       // 리드와 contig 끝/시작을 맞출 기준 길이
+    char* gap = (char*)malloc((size_t)fragLength + 1);
     int progress = 1;
     while (progress) {
         progress = 0;
@@ -665,7 +702,7 @@ char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** 
             char* c = contigs[i];
             int cl = clens[i];
 
-            // (결과 뒤 + contig 앞) 겹침 → contig 꼬리를 결과 뒤에 붙임
+            // (1) 겹침 병합 — (결과 뒤 + contig 앞)
             int ovR = contigOverlap(result, resLen, c, cl);
             if (ovR >= DBG_K - 1 && resLen + (cl - ovR) < resCap) {
                 memcpy(result + resLen, c + ovR, cl - ovR);
@@ -673,17 +710,43 @@ char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** 
                 result[resLen] = '\0';
                 mergedFlag[i] = 1; progress = 1; continue;
             }
-            // (contig 뒤 + 결과 앞) 겹침 → contig 머리를 결과 앞에 붙임
+            // (1) 겹침 병합 — (contig 뒤 + 결과 앞)
             int ovL = contigOverlap(c, cl, result, resLen);
             if (ovL >= DBG_K - 1 && resLen + (cl - ovL) < resCap) {
                 int add = cl - ovL;
-                memmove(result + add, result, resLen + 1);   // 결과를 오른쪽으로 밀고
-                memcpy(result, c, add);                      // 앞에 contig 머리 삽입
+                memmove(result + add, result, resLen + 1);
+                memcpy(result, c, add);
                 resLen += add;
                 mergedFlag[i] = 1; progress = 1; continue;
             }
+
+            // (2) 리드 다리 병합 — 겹침이 없을 때(커버리지 구멍) 틈을 리드로 메움.
+            // aTail/bHead(anchor)는 각각 result와 contig에 이미 들어있고, gap은 그 '사이'
+            // 틈이므로, 결합은 (이미 있는 쪽) + gap + (상대 contig 전체) 형태가 된다.
+            if (resLen >= anchor && cl >= anchor && gap != NULL) {
+                // 방향 A: [결과] + gap + [contig 전체]   (결과 끝 anchor 다음에 contig 시작 anchor가 오는 리드)
+                int gLen = findBridge(frags, result + resLen - anchor, c, anchor, gap, fragLength + 1);
+                if (gLen >= 0 && resLen + gLen + cl < resCap) {
+                    if (gLen > 0) { memcpy(result + resLen, gap, gLen); resLen += gLen; }
+                    memcpy(result + resLen, c, cl);          // contig 전체를 붙임
+                    resLen += cl;
+                    result[resLen] = '\0';
+                    mergedFlag[i] = 1; progress = 1; continue;
+                }
+                // 방향 B: [contig 전체] + gap + [결과]    (contig 끝 anchor 다음에 결과 시작 anchor가 오는 리드)
+                gLen = findBridge(frags, c + cl - anchor, result, anchor, gap, fragLength + 1);
+                if (gLen >= 0 && cl + gLen + resLen < resCap) {
+                    int add = cl + gLen;                     // 앞에 새로 들어갈 길이
+                    memmove(result + add, result, resLen + 1);
+                    memcpy(result, c, cl);                    // contig 전체
+                    if (gLen > 0) memcpy(result + cl, gap, gLen);  // 그 뒤 틈
+                    resLen += add;
+                    mergedFlag[i] = 1; progress = 1; continue;
+                }
+            }
         }
     }
+    free(gap);
 
     for (int i = 0; i < nContigs; i++) free(contigs[i]);
     free(contigs); free(clens); free(mergedFlag);
