@@ -92,13 +92,19 @@ int main(void) {
     }
 
     long totalBases = (long)fragNum * fragLength;
-    printf("=== 데이터 생성 파라미터 ===\n");
-    printf("원본 길이(N): %d | 리드 길이(L): %d | 리드 개수(M): %d | 커버리지: %.1f배 | K-mer: %d\n",
-           refLength, fragLength, fragNum,
-           (double)(fragNum * fragLength) / refLength, K_MER);
-    printf("에러율 설정: %d%% | 실제 주입된 미스매치: %d개 / %ld bp (%.2f%%)\n\n",
-           ERROR_RATE_PERCENT, injectedErrors, totalBases,
-           totalBases > 0 ? (100.0 * injectedErrors / totalBases) : 0.0);
+    printf("========== 실험 조건 (보고서/발표용 지표) ==========\n");
+    printf("[데이터]   원본 길이 N      : %d bp\n", refLength);
+    printf("[데이터]   리드 길이 L      : %d bp\n", fragLength);
+    printf("[데이터]   리드 개수 M      : %d 개\n", fragNum);
+    printf("[데이터]   커버리지         : %.1f 배  (= M*L / N)\n",
+           (double)(fragNum * fragLength) / refLength);
+    printf("[에러]     설정 에러율      : %d %%\n", ERROR_RATE_PERCENT);
+    printf("[에러]     실제 주입 미스매치: %d / %ld bp (%.2f %%)\n",
+           injectedErrors, totalBases, totalBases > 0 ? (100.0 * injectedErrors / totalBases) : 0.0);
+    printf("[파라미터] 인덱스 K-mer     : %d\n", K_MER);
+    printf("[파라미터] De Bruijn k      : %d\n", DBG_K);
+    printf("[파라미터] 에러 필터 임계빈도: %d (이하 k-mer는 에러로 제거)\n", DBG_MIN_FREQ);
+    printf("====================================================\n\n");
 
     // 공통 전처리: 인덱스 + 힙
     CountingIndex* countingIndex = buildCountingIndex(frags);
@@ -126,14 +132,20 @@ int main(void) {
     char* consensus = assembleConsensus(countingIndex, seedHeap, frags, MAX_MISMATCH);
     double t2 = (double)(clock() - s2) / CLOCKS_PER_SEC;
 
-    if (greedy != NULL) {
-        printf("########## [방식 1] 기존 Greedy 조립 ##########");
-        printPerformanceReport(ref, greedy, t1, calcMemory(countingIndex, seedHeap, strlen(greedy)));
-    }
-    if (consensus != NULL) {
-        printf("\n########## [방식 2] Consensus(다수결 투표) 보정 조립 ##########");
-        printPerformanceReport(ref, consensus, t2, calcMemory(countingIndex, seedHeap, strlen(consensus)));
-    }
+    double accGreedy = 0.0, accConsensus = 0.0;
+    if (greedy != NULL)
+        accGreedy = printPerformanceReport("방식1: 기존 Greedy 조립(벤치마크)",
+                        ref, greedy, t1, calcMemory(countingIndex, seedHeap, strlen(greedy)));
+    if (consensus != NULL)
+        accConsensus = printPerformanceReport("방식2: De Bruijn Consensus 조립(개선안)",
+                        ref, consensus, t2, calcMemory(countingIndex, seedHeap, strlen(consensus)));
+
+    // ===== 비교 요약 (한눈에 보기) =====
+    printf("\n+++++++++++++ 두 방식 비교 요약 (에러율 %d%%) +++++++++++++\n", ERROR_RATE_PERCENT);
+    printf("              복원율        속도(초)\n");
+    printf("  Greedy   : %6.2f %%     %.6f\n", accGreedy, t1);
+    printf("  Consensus: %6.2f %%     %.6f\n", accConsensus, t2);
+    printf("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++\n");
 
     // 메모리 해제
     free(consensus);

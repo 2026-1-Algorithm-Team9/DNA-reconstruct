@@ -674,8 +674,9 @@ char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** 
 // ===============================================================
 // 성능 리포트: 정확도(최적 오프셋 정렬) + 속도 + 메모리
 // ===============================================================
-void printPerformanceReport(const char* originalRef, const char* assembledRef, double duration, size_t memoryBytes) {
-    if (originalRef == NULL || assembledRef == NULL) return;
+double printPerformanceReport(const char* label, const char* originalRef,
+                              const char* assembledRef, double duration, size_t memoryBytes) {
+    if (originalRef == NULL || assembledRef == NULL) return 0.0;
 
     int N = (int)strlen(originalRef);
     int A = (int)strlen(assembledRef);
@@ -695,18 +696,17 @@ void printPerformanceReport(const char* originalRef, const char* assembledRef, d
     }
 
     double accuracy = (N > 0) ? (100.0 * bestMatches / N) : 0.0;
+    double covLen   = (N > 0) ? (100.0 * A / N) : 0.0;   // 조립이 원본 길이를 얼마나 펴냈나
 
-    printf("\n================ [성능 분석 리포트] ================\n");
-    printf("[정확도] 원본 복원율 : %.2f %% (%d / %d bp, 최적 오프셋 %d)\n",
-           accuracy, bestMatches, N, bestOffset);
+    printf("\n================ [%s] 성능 분석 리포트 ================\n", label);
+    printf("[정확도] 원본 복원율 : %6.2f %%   (일치 %d / 원본 %d bp)\n", accuracy, bestMatches, N);
+    printf("[정확도] 조립 길이비 : %6.2f %%   (조립 %d bp, 정렬 오프셋 %d)\n", covLen, A, bestOffset);
     printf("[속도]   알고리즘 시간: %.6f 초\n", duration);
-    printf("[메모리] 사용량      : %zu bytes (%.2f KB)\n",
-           memoryBytes, memoryBytes / 1024.0);
-    printf("----------------------------------------------------\n");
-    printf("원본 길이: %d | 조립 길이: %d\n", N, A);
+    printf("[메모리] 사용량      : %zu bytes (%.2f MB)\n", memoryBytes, memoryBytes / (1024.0 * 1024.0));
     if (N <= 200) {
-        printf("원본: %s\n", originalRef);
-        printf("조립: %s\n", assembledRef);
+        printf("----------------------------------------------------\n");
+        printf("원본: %s\n조립: %s\n", originalRef, assembledRef);
     }
-    printf("====================================================\n");
+    printf("==========================================================\n");
+    return accuracy;
 }

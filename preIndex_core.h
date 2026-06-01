@@ -70,13 +70,16 @@ void hashToKmer(int hash, char* out);
 void printCountingIndex(const CountingIndex* index, char** frags);
 void printTopSeeds(MaxHeap* heap, int topN);
 
-// 5단계: 우선순위 기반 조립 + 성능 리포트
+// 5단계: 우선순위 기반 조립 (greedy, 벤치마크)
 char* assembleReads(const CountingIndex* index, const MaxHeap* heap, char** frags, int maxMismatch);
-void printPerformanceReport(const char* originalRef, const char* assembledRef, double duration, size_t memoryBytes);
 
-// 5단계+: Consensus(다수결 투표) 보정 조립
-// greedy 골격을 만든 뒤, 모든 리드를 골격에 매핑해 위치별로 A/C/G/T 투표,
-// 다수결로 각 위치를 확정해 리드의 시퀀싱 에러를 커버리지로 눌러 정정한다.
+// 5단계+: De Bruijn 그래프 기반 Consensus 조립 (에러 내성 개선안)
+// 리드를 작은 k-mer로 쪼개 저빈도(에러) k-mer를 버리고, 고빈도 k-mer를
+// 다수결로 이어붙여 커버리지로 시퀀싱 에러를 정정한다.
 char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** frags, int maxMismatch);
+
+// 성능 리포트 출력 + 복원율(%) 반환. label은 방식 이름.
+double printPerformanceReport(const char* label, const char* originalRef,
+                              const char* assembledRef, double duration, size_t memoryBytes);
 
 #endif
