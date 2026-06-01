@@ -5,6 +5,14 @@
 
 #include "preIndex_core.h"
 
+// OS와 무관하게 충분히 큰 난수 생성.
+// Windows(MinGW)의 RAND_MAX는 32767로 작아, rand()만 쓰면 startIndex가
+// 원본 앞부분에만 몰려 뒤쪽이 리드로 안 덮인다(복원율 급락). rand()를 두 번
+// 조합해 약 30비트 난수를 만들어 어느 환경에서도 전 범위가 고르게 나오게 한다.
+static long bigRand(void) {
+    return ((long)rand() << 15) | (long)rand();
+}
+
 char* makeRef() {
     char basis[4] = {'A', 'T', 'C', 'G'};
 
@@ -29,7 +37,7 @@ char** makeFrag(char* ref) {
     for (int i = 0; i < fragNum; i++) {
         frags[i] = (char*)malloc((fragLength + 1) * sizeof(char));
 
-        int startIndex = rand() % (refLength - fragLength + 1);   // 원본에서 랜덤 시작 위치
+        int startIndex = bigRand() % (refLength - fragLength + 1);   // 원본에서 랜덤 시작 위치 (OS 무관)
         for (int j = 0; j < fragLength; j++) {
             frags[i][j] = ref[startIndex + j];                    // 원본의 substring을 그대로 떼옴
         }
