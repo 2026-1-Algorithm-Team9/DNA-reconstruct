@@ -7,7 +7,7 @@
 // refLength(원본 길이)만 바꾸면 리드 길이/개수가 커버리지에 맞춰 자동 조정됩니다.
 // (권장: refLength >= 400. 너무 작으면 fragLength가 K_MER보다 작아져 동작 불가)
 #define refLength    20000                                 // 원본 게놈 길이 (N)
-#define COVERAGE     50                                    // 목표 커버리지 (배수)
+#define COVERAGE     60                                    // 목표 커버리지 (배수)
 #define fragLength   100                                   // 리드 길이 (L) — 현실적 짧은 리드
 #define fragNum      ((refLength * COVERAGE) / fragLength) // 리드 개수 (M) = 커버리지 유지, 자동
 

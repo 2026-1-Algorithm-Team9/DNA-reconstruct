@@ -451,6 +451,13 @@ char* assembleReads(const CountingIndex* index, const MaxHeap* heap, char** frag
 //     - 양방향(오른쪽/왼쪽)으로 확장해 원본을 복원한다.
 // ===============================================================
 
+// qsort로 k-mer 해시를 빈도 내림차순 정렬하기 위한 비교 함수와 빈도표 포인터.
+int* dbgFreqForSort = NULL;
+int dbgCompareByFreq(const void* a, const void* b) {
+    int ha = *(const int*)a, hb = *(const int*)b;
+    return dbgFreqForSort[hb] - dbgFreqForSort[ha];   // 높은 빈도가 앞으로
+}
+
 // DBG_K 길이 k-mer 빈도표 생성 (리드를 슬라이딩하며 카운트). 에러 필터의 기반.
 static int* buildDbgFreq(char** frags) {
     int* freq = (int*)calloc((size_t)DBG_HASH_SIZE, sizeof(int));
@@ -492,69 +499,174 @@ static int bestPrev(const int* freq, int curHash, int highBitShift) {
     return bestBase;
 }
 
-char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** frags, int maxMismatch) {
-    (void)index; (void)heap; (void)maxMismatch;   // 이 방식은 DBG_K 빈도표만 사용
-
-    int* freq = buildDbgFreq(frags);
-    if (freq == NULL) return NULL;
+// 시드 k-mer 하나에서 양방향으로 확장해 contig 하나를 만든다.
+// visited는 호출 간 공유되어 같은 k-mer를 두 번 조립하지 않게 한다(여러 contig 분리).
+// 반환: 새로 malloc된 contig 문자열(호출자가 free), 길이는 *outLen.
+static char* growContig(const int* freq, int seedHash, char* visited, int* outLen) {
     int cut = (1 << (DBG_K * 2)) - 1;
-    int highBitShift = (DBG_K - 1) * 2;            // 앞쪽 염기를 끼울 비트 위치
+    int highBitShift = (DBG_K - 1) * 2;
 
-    // 시작점: 빈도가 가장 높은 k-mer (가장 신뢰도 높은 지점에서 조립 시작)
-    int seedHash = 0, seedFreq = -1;
-    for (int h = 0; h < DBG_HASH_SIZE; h++) {
-        if (freq[h] > seedFreq) { seedFreq = freq[h]; seedHash = h; }
-    }
-    if (seedFreq < DBG_MIN_FREQ) { free(freq); return NULL; }   // 쓸만한 k-mer 없음
-
-    // 결과 버퍼: 양방향 확장을 위해 정중앙에서 시작
-    int maxLen = refLength * 2 + fragLength + 16;   // 원본보다 넉넉히
+    int maxLen = refLength * 2 + fragLength + 16;
     char* buf = (char*)calloc((size_t)maxLen, 1);
-    if (buf == NULL) { free(freq); return NULL; }
-    int center = maxLen / 2;
-    char* start = buf + center;
+    if (buf == NULL) { *outLen = 0; return NULL; }
+    char* start = buf + maxLen / 2;
 
-    // 방문한 k-mer 재방문 방지(반복서열에서 무한루프 차단)
-    char* visited = (char*)calloc((size_t)DBG_HASH_SIZE, 1);
-
-    // 시드 k-mer를 가운데에 펼쳐 적기
-    char seedStr[DBG_K + 1];
-    { int h = seedHash; for (int i = DBG_K - 1; i >= 0; i--) { seedStr[i] = "ACGT"[h & 3]; h >>= 2; } seedStr[DBG_K] = '\0'; }
-    memcpy(start, seedStr, DBG_K);
+    // 시드를 가운데에 적기
+    { int h = seedHash; for (int i = DBG_K - 1; i >= 0; i--) { start[i] = "ACGT"[h & 3]; h >>= 2; } }
     int len = DBG_K;
-    if (visited) visited[seedHash] = 1;
+    visited[seedHash] = 1;
 
-    // ---------- 오른쪽 확장 ----------
+    // 오른쪽 확장: 다음 글자 후보 중 최고 빈도(>=DBG_MIN_FREQ)로 한 칸씩 전진
     int curHash = seedHash;
     while ((start - buf) + len < maxLen - 1) {
         int b = bestNext(freq, curHash, cut);
         if (b < 0) break;
         int nextHash = ((curHash << 2) | b) & cut;
-        if (visited && visited[nextHash]) break;     // 반복 진입 차단
+        if (visited[nextHash]) break;                 // 이미 다른 contig가 쓴 구간 → 멈춤
         start[len++] = "ACGT"[b];
         curHash = nextHash;
-        if (visited) visited[nextHash] = 1;
+        visited[nextHash] = 1;
     }
 
-    // ---------- 왼쪽 확장 ----------
+    // 왼쪽 확장
     curHash = seedHash;
     while (start - buf > 1) {
         int b = bestPrev(freq, curHash, highBitShift);
         if (b < 0) break;
         int prevHash = (curHash >> 2) | (b << highBitShift);
-        if (visited && visited[prevHash]) break;
+        if (visited[prevHash]) break;
         start--; len++;
         start[0] = "ACGT"[b];
         curHash = prevHash;
-        if (visited) visited[prevHash] = 1;
+        visited[prevHash] = 1;
     }
 
-    char* result = (char*)malloc((size_t)len + 1);
-    if (result) { memcpy(result, start, len); result[len] = '\0'; }
-
-    if (visited) free(visited);
+    char* contig = (char*)malloc((size_t)len + 1);
+    if (contig) { memcpy(contig, start, len); contig[len] = '\0'; }
     free(buf);
+    *outLen = (contig != NULL) ? len : 0;
+    return contig;
+}
+
+// 두 contig가 (a의 접미부 == b의 접두부)로 겹치는 최대 길이를 찾는다.
+// DBG_K-1 이상 겹쳐야 De Bruijn 상 실제 인접으로 인정. 없으면 0.
+static int contigOverlap(const char* a, int aLen, const char* b, int bLen) {
+    int maxOv = (aLen < bLen) ? aLen : bLen;
+    for (int ov = maxOv; ov >= DBG_K - 1; ov--) {
+        if (memcmp(a + aLen - ov, b, ov) == 0) return ov;
+    }
+    return 0;
+}
+
+char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** frags, int maxMismatch) {
+    (void)index; (void)heap; (void)maxMismatch;   // 이 방식은 DBG_K 빈도표만 사용
+
+    int* freq = buildDbgFreq(frags);
+    if (freq == NULL) return NULL;
+
+    char* visited = (char*)calloc((size_t)DBG_HASH_SIZE, 1);
+    if (visited == NULL) { free(freq); return NULL; }
+
+    // [0] 실제 등장한 k-mer 해시만 수집해 빈도 내림차순으로 정렬한다.
+    // (DBG_HASH_SIZE는 4^15≈10억이라 매번 전체 스캔하면 매우 느리다. 실제 등장한
+    //  k-mer는 리드 길이×개수 수준뿐이므로 그 목록만 다루면 시드 선택이 빨라진다.)
+    int cap = fragNum * fragLength;
+    int* seedList = (int*)malloc((size_t)cap * sizeof(int));
+    int seedCount = 0;
+    {
+        int cutk = (1 << (DBG_K * 2)) - 1;
+        char* seen = (char*)calloc((size_t)DBG_HASH_SIZE, 1);   // 중복 수집 방지
+        for (int r = 0; r < fragNum && seen; r++) {
+            char* read = frags[r];
+            int h = 0;
+            for (int j = 0; j < DBG_K; j++) h = (h << 2) | charToBit(read[j]);
+            for (int j = DBG_K - 1; j < fragLength; j++) {
+                if (j >= DBG_K) h = ((h << 2) | charToBit(read[j])) & cutk;
+                if (!seen[h] && freq[h] > DBG_MIN_FREQ) { seen[h] = 1; seedList[seedCount++] = h; }
+            }
+        }
+        if (seen) free(seen);
+    }
+    // 빈도 내림차순 정렬(간단 삽입정렬은 느리므로 qsort 대신 freq 비교 선택정렬 대체:
+    // 여기서는 빈도 높은 시드부터 쓰면 충분하므로 qsort 사용)
+    // qsort 비교를 위해 freq 전역 접근이 필요 → 정적 포인터로 전달
+    extern int dbgCompareByFreq(const void*, const void*);
+    dbgFreqForSort = freq;
+    qsort(seedList, seedCount, sizeof(int), dbgCompareByFreq);
+
+    // [1] 빈도 높은 시드부터 contig를 확장해 수집한다.
+    const int MAX_CONTIGS = 256;
+    char** contigs = (char**)malloc(MAX_CONTIGS * sizeof(char*));
+    int* clens = (int*)malloc(MAX_CONTIGS * sizeof(int));
+    int nContigs = 0;
+
+    for (int s = 0; s < seedCount && nContigs < MAX_CONTIGS; s++) {
+        int seedHash = seedList[s];
+        if (visited[seedHash]) continue;        // 이미 다른 contig가 흡수한 시드
+
+        int len = 0;
+        char* contig = growContig(freq, seedHash, visited, &len);
+        if (contig == NULL) break;
+        if (len >= DBG_K) {
+            contigs[nContigs] = contig;
+            clens[nContigs] = len;
+            nContigs++;
+        } else {
+            free(contig);
+        }
+    }
+
+    free(seedList);
+    free(visited);
     free(freq);
+
+    if (nContigs == 0) { free(contigs); free(clens); return NULL; }
+
+    // [2] contig 병합: 가장 긴 것을 뼈대로, 끝-시작이 겹치는 조각을 반복적으로 이어붙인다.
+    // 가장 긴 contig를 시작 결과로 선택
+    int bestIdx = 0;
+    for (int i = 1; i < nContigs; i++) if (clens[i] > clens[bestIdx]) bestIdx = i;
+
+    int resCap = refLength * 2 + 16;
+    char* result = (char*)malloc((size_t)resCap);
+    int resLen = clens[bestIdx];
+    memcpy(result, contigs[bestIdx], resLen);
+    result[resLen] = '\0';
+
+    char* mergedFlag = (char*)calloc(nContigs, 1);
+    mergedFlag[bestIdx] = 1;
+
+    // 더 이상 붙일 게 없을 때까지 반복: 남은 contig 중 결과와 겹치는 것을 찾아 결합
+    int progress = 1;
+    while (progress) {
+        progress = 0;
+        for (int i = 0; i < nContigs; i++) {
+            if (mergedFlag[i]) continue;
+            char* c = contigs[i];
+            int cl = clens[i];
+
+            // (결과 뒤 + contig 앞) 겹침 → contig 꼬리를 결과 뒤에 붙임
+            int ovR = contigOverlap(result, resLen, c, cl);
+            if (ovR >= DBG_K - 1 && resLen + (cl - ovR) < resCap) {
+                memcpy(result + resLen, c + ovR, cl - ovR);
+                resLen += cl - ovR;
+                result[resLen] = '\0';
+                mergedFlag[i] = 1; progress = 1; continue;
+            }
+            // (contig 뒤 + 결과 앞) 겹침 → contig 머리를 결과 앞에 붙임
+            int ovL = contigOverlap(c, cl, result, resLen);
+            if (ovL >= DBG_K - 1 && resLen + (cl - ovL) < resCap) {
+                int add = cl - ovL;
+                memmove(result + add, result, resLen + 1);   // 결과를 오른쪽으로 밀고
+                memcpy(result, c, add);                      // 앞에 contig 머리 삽입
+                resLen += add;
+                mergedFlag[i] = 1; progress = 1; continue;
+            }
+        }
+    }
+
+    for (int i = 0; i < nContigs; i++) free(contigs[i]);
+    free(contigs); free(clens); free(mergedFlag);
     return result;
 }
 
