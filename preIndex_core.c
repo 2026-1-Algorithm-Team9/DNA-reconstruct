@@ -497,9 +497,10 @@ static MaxHeap* buildSeedHeapFromFreq(const int* freq, const int* seedList, int 
 }
 
 // 현재 k-mer(curHash)의 뒤에 A/C/G/T를 붙여 만든 4개의 다음 k-mer 중
-// 빈도가 가장 높은(>=DBG_MIN_FREQ) 것을 선택. 반환: 추가된 염기 비트(0~3), 없으면 -1.
-static int bestNext(const int* freq, int curHash, int cut) {
-    int bestBase = -1, bestFreq = DBG_MIN_FREQ;   // 임계값 이하(에러)는 무시
+// 빈도가 minFreq 초과로 가장 높은 것을 선택. 반환: 추가된 염기 비트(0~3), 없으면 -1.
+// minFreq=DBG_MIN_FREQ면 저빈도(에러) k-mer를 거르고, 0이면 에러 k-mer도 따라간다.
+static int bestNext(const int* freq, int curHash, int cut, int minFreq) {
+    int bestBase = -1, bestFreq = minFreq;
     for (int b = 0; b < 4; b++) {
         int nextHash = ((curHash << 2) | b) & cut;
         if (freq[nextHash] > bestFreq) { bestFreq = freq[nextHash]; bestBase = b; }
@@ -508,8 +509,8 @@ static int bestNext(const int* freq, int curHash, int cut) {
 }
 
 // 현재 k-mer(curHash)의 앞에 A/C/G/T를 붙여 만든 4개의 이전 k-mer 중 최고 빈도 선택.
-static int bestPrev(const int* freq, int curHash, int highBitShift) {
-    int bestBase = -1, bestFreq = DBG_MIN_FREQ;
+static int bestPrev(const int* freq, int curHash, int highBitShift, int minFreq) {
+    int bestBase = -1, bestFreq = minFreq;
     for (int b = 0; b < 4; b++) {
         int prevHash = (curHash >> 2) | (b << highBitShift);
         if (freq[prevHash] > bestFreq) { bestFreq = freq[prevHash]; bestBase = b; }
@@ -520,7 +521,8 @@ static int bestPrev(const int* freq, int curHash, int highBitShift) {
 // 시드 k-mer 하나에서 양방향으로 greedy 확장해 contig 하나를 만든다.
 // 매 칸 가장 빈도 높은 다음 k-mer로 전진(=위치별 다수결). visited는 반복서열에서의
 // 무한루프 차단용. 한 번 방문한 k-mer를 다시 만나면 멈춘다.
-static char* growContig(const int* freq, int seedHash, char* visited, int* outLen) {
+// minFreq: 따라갈 k-mer의 최소 빈도 임계값(보정 ON=DBG_MIN_FREQ, 기본형 OFF=0).
+static char* growContig(const int* freq, int seedHash, char* visited, int* outLen, int minFreq) {
     int cut = (1 << (DBG_K * 2)) - 1;
     int highBitShift = (DBG_K - 1) * 2;
 
@@ -536,7 +538,7 @@ static char* growContig(const int* freq, int seedHash, char* visited, int* outLe
     // 오른쪽 확장
     int curHash = seedHash;
     while ((start - buf) + len < maxLen - 1) {
-        int b = bestNext(freq, curHash, cut);
+        int b = bestNext(freq, curHash, cut, minFreq);
         if (b < 0) break;
         int nextHash = ((curHash << 2) | b) & cut;
         if (visited[nextHash]) break;
@@ -548,7 +550,7 @@ static char* growContig(const int* freq, int seedHash, char* visited, int* outLe
     // 왼쪽 확장
     curHash = seedHash;
     while (start - buf > 1) {
-        int b = bestPrev(freq, curHash, highBitShift);
+        int b = bestPrev(freq, curHash, highBitShift, minFreq);
         if (b < 0) break;
         int prevHash = (curHash >> 2) | (b << highBitShift);
         if (visited[prevHash]) break;
@@ -610,18 +612,17 @@ static int findBridge(char** frags, const char* aTail, const char* bHead,
     return -1;
 }
 
-char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** frags, int maxMismatch) {
-    (void)index; (void)heap; (void)maxMismatch;   // 이 방식은 DBG_K 빈도표만 사용
-
+// De Bruijn 조립의 공통 구현. 두 변주가 이 함수를 파라미터만 달리해 호출한다.
+//   minFreq   : 따라갈 k-mer 최소 빈도. DBG_MIN_FREQ=저빈도(에러) 필터 ON, 0=OFF(기본형).
+//   useBridge : 1이면 리드 다리 병합(커버리지 구멍 메우기)까지, 0이면 겹침 병합만.
+static char* assembleDbgImpl(char** frags, int minFreq, int useBridge) {
     int* freq = buildDbgFreq(frags);
     if (freq == NULL) return NULL;
 
     char* visited = (char*)calloc((size_t)DBG_HASH_SIZE, 1);
     if (visited == NULL) { free(freq); return NULL; }
 
-    // [0] 실제 등장한 k-mer 해시만 수집해 빈도 내림차순으로 정렬한다.
-    // (DBG_HASH_SIZE는 4^15≈10억이라 매번 전체 스캔하면 매우 느리다. 실제 등장한
-    //  k-mer는 리드 길이×개수 수준뿐이므로 그 목록만 다루면 시드 선택이 빨라진다.)
+    // [0] 실제 등장한 k-mer 해시만 수집한다(전체 4^k 스캔 회피). minFreq로 에러 필터.
     int cap = fragNum * fragLength;
     int* seedList = (int*)malloc((size_t)cap * sizeof(int));
     int seedCount = 0;
@@ -634,15 +635,12 @@ char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** 
             for (int j = 0; j < DBG_K; j++) h = (h << 2) | charToBit(read[j]);
             for (int j = DBG_K - 1; j < fragLength; j++) {
                 if (j >= DBG_K) h = ((h << 2) | charToBit(read[j])) & cutk;
-                if (!seen[h] && freq[h] > DBG_MIN_FREQ) { seen[h] = 1; seedList[seedCount++] = h; }
+                if (!seen[h] && freq[h] > minFreq) { seen[h] = 1; seedList[seedCount++] = h; }
             }
         }
         if (seen) free(seen);
     }
-    // [변형 A] 4단계 Max Heap 자료구조로 시드 우선순위를 관리한다.
-    // 기존엔 qsort로 전체 정렬했지만, "신뢰도(빈도) 높은 시드부터 하나씩 꺼내는"
-    // 우리 용도엔 Max Heap(extractMax)이 자료구조적으로 더 적합하다.
-    // 이로써 4단계(Max Heap)가 5단계(조립 시작점 선택)에 실제로 연결된다.
+    // [변형 A] 4단계 Max Heap 자료구조로 시드 우선순위를 관리(고빈도 시드부터 추출).
     MaxHeap* seedHeap = buildSeedHeapFromFreq(freq, seedList, seedCount);
     free(seedList);
     if (seedHeap == NULL) { free(visited); free(freq); return NULL; }
@@ -660,7 +658,7 @@ char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** 
         if (visited[seedHash]) continue;            // 이미 다른 contig가 흡수한 시드
 
         int len = 0;
-        char* contig = growContig(freq, seedHash, visited, &len);
+        char* contig = growContig(freq, seedHash, visited, &len, minFreq);
         if (contig == NULL) break;
         if (len >= DBG_K) {
             contigs[nContigs] = contig;
@@ -723,7 +721,8 @@ char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** 
             // (2) 리드 다리 병합 — 겹침이 없을 때(커버리지 구멍) 틈을 리드로 메움.
             // aTail/bHead(anchor)는 각각 result와 contig에 이미 들어있고, gap은 그 '사이'
             // 틈이므로, 결합은 (이미 있는 쪽) + gap + (상대 contig 전체) 형태가 된다.
-            if (resLen >= anchor && cl >= anchor && gap != NULL) {
+            // 기본형(useBridge=0)에서는 이 보정을 건너뛴다.
+            if (useBridge && resLen >= anchor && cl >= anchor && gap != NULL) {
                 // 방향 A: [결과] + gap + [contig 전체]   (결과 끝 anchor 다음에 contig 시작 anchor가 오는 리드)
                 int gLen = findBridge(frags, result + resLen - anchor, c, anchor, gap, fragLength + 1);
                 if (gLen >= 0 && resLen + gLen + cl < resCap) {
@@ -751,6 +750,12 @@ char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** 
     for (int i = 0; i < nContigs; i++) free(contigs[i]);
     free(contigs); free(clens); free(mergedFlag);
     return result;
+}
+
+// 개선안: 저빈도(에러) 필터 + 고빈도 다수결 + 리드 다리 보정을 모두 적용한다.
+char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** frags, int maxMismatch) {
+    (void)index; (void)heap; (void)maxMismatch;
+    return assembleDbgImpl(frags, /*minFreq=*/DBG_MIN_FREQ, /*useBridge=*/1);
 }
 
 

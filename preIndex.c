@@ -122,12 +122,12 @@ int main(void) {
 
     printTopSeeds(seedHeap, 5);
 
-    // ===== [방식 1] 기존 greedy 조립 (벤치마크) =====
+    // ===== [방식 1] 기존 Greedy 조립 (리드 기반 벤치마크) =====
     clock_t s1 = clock();
     char* greedy = assembleReads(countingIndex, seedHeap, frags, MAX_MISMATCH);
     double t1 = (double)(clock() - s1) / CLOCKS_PER_SEC;
 
-    // ===== [방식 2] Consensus 보정 조립 (우리 개선안) =====
+    // ===== [방식 2] De Bruijn + Consensus 조립 (우리 개선안) =====
     clock_t s2 = clock();
     char* consensus = assembleConsensus(countingIndex, seedHeap, frags, MAX_MISMATCH);
     double t2 = (double)(clock() - s2) / CLOCKS_PER_SEC;
