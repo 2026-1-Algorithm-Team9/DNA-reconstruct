@@ -1,114 +1,157 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
-#define refLength 100   // ¿øº» ¿°±â¼­¿­ ±æÀÌ
-#define fragLength 10   // Á¶°¢(Read) ±æÀÌ
-#define fragNum 10      // Á¶°¢ °³¼ö
-#define K_MER 3         // ÀÚ¸¦ k-merÀÇ ±æÀÌ
-#define HASH_SIZE (1 << (K_MER * 2))    // ÇØ½Ã Å©±â
+#include "preIndex_core.h"
 
-/* charToBit, freqArray ÇÔ¼ö ±¸ÇöÇß½À´Ï´Ù
-   charToBit, freqArray ÇÔ¼ö¶û mainÇÔ¼ö ÀÏºÎ¸¸ °¡Á®´Ù ¾²¸é µÉ °Í °°¾Æ¿ë
-   main¿¡´Â charToBit, freqArray ÇÔ¼ö°¡ Àß µ¿ÀÛÇÏ´ÂÁö È®ÀÎ¿ë ÄÚµå¸¦ Àû¾î³õ¾Æ¼­ ³ªÁß¿¡ Áö¿ï °Íµé Áö¿ì¸é µÉµí¿ä */
-
-// ¹®ÀÚ¸¦ 2ºñÆ® Á¤¼ö·Î ¸ÅÇÎ (A=00, C=01, G=10, T=11)
-int charToBit(char c) {
-    switch (c) {
-        case 'A': return 0; 
-        case 'C': return 1; 
-        case 'G': return 2; 
-        case 'T': return 3;
-    }
-}
-
-int* freqArray(char** frags) {
-    // ºóµµ Ä«¿îÆÃ ¹è¿­ µ¿Àû ÇÒ´ç ¹× 0À¸·Î ±ú²ıÇÏ°Ô ÃÊ±âÈ­ (calloc »ç¿ë)
-    int* countArray = (int*)calloc(HASH_SIZE, sizeof(int));
-    if (countArray == NULL) return NULL;
-
-    // k-mer Å©±â¸¸Å­¸¸ ºñÆ®¸¦ ³²±â±â À§ÇÑ º¯¼ö cut
-    int cut = (1 << (K_MER * 2)) - 1;
-
-    for (int i = 0; i < fragNum; i++) {
-        char* read = frags[i];
-        int currentHash = 0;
-
-        // ÃÖÃÊ k-mer ÇØ½Ã »ı¼º (Ã¹ k±ÛÀÚ ºñÆ® Á¶¸³)
-        for (int j = 0; j < K_MER; j++) {
-            currentHash = (currentHash << 2) | charToBit(read[j]);
-        }
-        // Ã¹ ¹øÂ° ÇØ½Ã ÁÖ¼Ò ¹æ¿¡ Ä«¿îÆ® +1
-        countArray[currentHash]++; 
-
-        // ¶óºó-Ä«ÇÁ ±â¹İ Rolling Hash·Î ½½¶óÀÌµù
-        for (int j = K_MER; j < fragLength; j++) {
-            // ÀÚ¸´¼ö ¹Ğ°í, »õ ±ÛÀÚ ÇÕÄ¡°í, cutÀ¸·Î ÀÚ¸£±â
-            currentHash = ((currentHash << 2) | charToBit(read[j])) & cut;
-            
-            // Æ¢¾î³ª¿Â ÇØ½Ã ÁÖ¼Ò ¹æ¿¡ ½Ç½Ã°£ Ä«¿îÆ® +1
-            countArray[currentHash]++; 
-        }
-    }
-
-    return countArray; // °è¼ö Á¤·Ä À§ÇÑ ¿Ï¼ºµÈ ºóµµ ¼öÃ¸ ¹İÈ¯
+// OSì™€ ë¬´ê´€í•˜ê²Œ ì¶©ë¶„íˆ í° ë‚œìˆ˜ ìƒì„±.
+// Windows(MinGW)ì˜ RAND_MAXëŠ” 32767ë¡œ ì‘ì•„, rand()ë§Œ ì“°ë©´ startIndexê°€
+// ì›ë³¸ ì•ë¶€ë¶„ì—ë§Œ ëª°ë ¤ ë’¤ìª½ì´ ë¦¬ë“œë¡œ ì•ˆ ë®ì¸ë‹¤(ë³µì›ìœ¨ ê¸‰ë½). rand()ë¥¼ ë‘ ë²ˆ
+// ì¡°í•©í•´ ì•½ 30ë¹„íŠ¸ ë‚œìˆ˜ë¥¼ ë§Œë“¤ì–´ ì–´ëŠ í™˜ê²½ì—ì„œë„ ì „ ë²”ìœ„ê°€ ê³ ë¥´ê²Œ ë‚˜ì˜¤ê²Œ í•œë‹¤.
+static long bigRand(void) {
+    return ((long)rand() << 15) | (long)rand();
 }
 
 char* makeRef() {
     char basis[4] = {'A', 'T', 'C', 'G'};
 
-    // ¿°±â ¼­¿­ ÀúÀåÇÏ±â À§ÇÑ ¹è¿­ µ¿Àû ÇÒ´ç (+1Àº ¹®ÀÚ¿­ Á¾·á ¹®ÀÚ '\0'¸¦ À§ÇØ)
+    // ì›ë³¸ ì—¼ê¸°ì„œì—´ì€ A/C/G/Të¥¼ ì™„ì „ ëœë¤ìœ¼ë¡œ ìƒì„± (ê°€ìƒì˜ ì •ë‹µ ê²Œë†ˆ)
     char* ref = (char*)malloc((refLength + 1) * sizeof(char));
-    srand(time(NULL));
+    if (ref == NULL) return NULL;
+    srand((unsigned int)time(NULL));
 
     for (int i = 0; i < refLength; i++) {
         int index = rand() % 4;
         ref[i] = basis[index];
     }
-    ref[refLength] = '\0'; // ¹®ÀÚ¿­ Á¾·á ¹®ÀÚ Ãß°¡
+    ref[refLength] = '\0';
 
     return ref;
 }
 
-char** makeFrag(char* ref) {
-    char** frags = (char**)malloc(fragNum * sizeof(char*));     // Á¶°¢µéÀ» ÀúÀåÇÏ±â À§ÇÑ 2Â÷¿ø ¹è¿­À» µ¿ÀûÀ¸·Î ÇÒ´ç
+// í•œ ì—¼ê¸°ë¥¼ ìì‹ ê³¼ ë‹¤ë¥¸ 3ê°œ ì¤‘ í•˜ë‚˜ë¡œ ë¬´ì‘ìœ„ ì¹˜í™˜ (= ë¯¸ìŠ¤ë§¤ì¹˜ 1ê°œ ë°œìƒ)
+static char mutateBase(char original) {
+    char basis[4] = {'A', 'C', 'G', 'T'};
+    char c;
+    do {
+        c = basis[rand() % 4];
+    } while (c == original);
+    return c;
+}
+
+char** makeFrag(char* ref, int* outInjectedErrors) {
+    char** frags = (char**)malloc(fragNum * sizeof(char*));
+    if (frags == NULL) return NULL;
+
+    int injected = 0;
 
     for (int i = 0; i < fragNum; i++) {
-        frags[i] = (char*)malloc((fragLength+1) * sizeof(char));     // °¢ Á¶°¢À» ÀúÀåÇÏ±â À§ÇÑ ¹è¿­ µ¿Àû ÇÒ´ç (+1Àº ¹®ÀÚ¿­ Á¾·á ¹®ÀÚ '\0'¸¦ À§ÇØ)
+        frags[i] = (char*)malloc((fragLength + 1) * sizeof(char));
 
-        int startIndex = rand() % (refLength - fragLength + 1);     // ¿øº» ¿°±â¼­¿­¿¡¼­ Á¶°¢À» ½ÃÀÛÇÒ ·£´ıÇÑ ÀÎµ¦½º »ı¼º
+        int startIndex = bigRand() % (refLength - fragLength + 1);   
         for (int j = 0; j < fragLength; j++) {
-            frags[i][j] = ref[startIndex + j];     // ¿øº» ¿°±â¼­¿­¿¡¼­ Á¶°¢À» ÃßÃâÇÏ¿© frags ¹è¿­¿¡ ÀúÀå
+            char base = ref[startIndex + j];                         // ì›ë³¸ì˜ substringì„ ë–¼ì˜´
+
+            // ERROR_RATE_PERCENT í™•ë¥ ë¡œ ì‹œí€€ì‹± ì—ëŸ¬(ë¯¸ìŠ¤ë§¤ì¹˜) ì£¼ì…
+            if (ERROR_RATE_PERCENT > 0 && (rand() % 100) < ERROR_RATE_PERCENT) {
+                base = mutateBase(base);
+                injected++;
+            }
+            frags[i][j] = base;
         }
-        frags[i][fragLength] = '\0';      // ¹®ÀÚ¿­ Á¾·á ¹®ÀÚ Ãß°¡
+        frags[i][fragLength] = '\0';
     }
 
+    if (outInjectedErrors != NULL) *outInjectedErrors = injected;
     return frags;
 }
 
+// ë©”ëª¨ë¦¬ ì‚¬ìš©ëŸ‰ í•©ì‚° (malloc ê¸°ì¤€ ê°„ë‹¨ ì¸¡ì •)
+static size_t calcMemory(const CountingIndex* idx, const MaxHeap* heap, size_t assembledLen) {
+    size_t bytes = 0;
+    bytes += countingIndexMemory(idx);
+    bytes += maxHeapMemory(heap);
+    bytes += (size_t)fragNum * sizeof(char*) + (size_t)fragNum * (fragLength + 1);  // ë¦¬ë“œ
+    bytes += (size_t)(refLength + 1);                                               // ì›ë³¸
+    bytes += (size_t)(fragNum * fragLength * 2 + 1);                                // ì¡°ë¦½ ì„ì‹œë²„í¼(peak)
+    bytes += assembledLen + 1;                                                      // ê²°ê³¼ ì„œì—´
+    return bytes;
+}
+
 int main(void) {
+    int injectedErrors = 0;
     char* ref = makeRef();
-    char** frags = makeFrag(ref);  
+    char** frags = (ref != NULL) ? makeFrag(ref, &injectedErrors) : NULL;
 
-    printf("=== »ı¼ºµÈ ¿øº» ¿°±â ¼­¿­ ===\n");
-    printf("%s\n\n", ref);
-
-    printf("=== »ı¼ºµÈ ¼ô ¸®µå Á¶°¢ %d°³ ===\n", fragNum);
-    for (int i = 0; i < fragNum; i++) printf("[%d] %s\n", i + 1, frags[i]);
-    printf("\n");
-
-    int* freqResult = freqArray(frags);
-
-    // ÇØ½ÃÀÇ ¸î ¹ø ¹æ¿¡ Ä«¿îÆ®°¡ ½×¿´´ÂÁö È®ÀÎ ÄÚµå
-    printf("=== ºóµµ Ä«¿îÆÃ Á¤Àû ¹è¿­ (%d°³ÀÇ ¹æ) ===\n", HASH_SIZE);
-    for (int i = 0; i < HASH_SIZE; i++) {
-        if (freqResult[i] > 0) {
-            printf("ÇØ½Ã ÁÖ¼Ò [%2d¹ø ¹æ] -> µîÀå ºóµµ: %dÈ¸\n", i, freqResult[i]);
-        }
+    if (ref == NULL || frags == NULL) {
+        printf("ì´ˆê¸° ë°ì´í„° ìƒì„±ì— ì‹¤íŒ¨í–ˆìŠµë‹ˆë‹¤.\n");
+        free(frags);
+        free(ref);
+        return 1;
     }
 
-    // ¸Ş¸ğ¸® ÇØÁ¦
-    free(freqResult);
+    long totalBases = (long)fragNum * fragLength;
+    printf("========== ì‹¤í—˜ ì¡°ê±´ (ë³´ê³ ì„œ/ë°œí‘œìš© ì§€í‘œ) ==========\n");
+    printf("[ë°ì´í„°]   ì›ë³¸ ê¸¸ì´ N      : %d bp\n", refLength);
+    printf("[ë°ì´í„°]   ë¦¬ë“œ ê¸¸ì´ L      : %d bp\n", fragLength);
+    printf("[ë°ì´í„°]   ë¦¬ë“œ ê°œìˆ˜ M      : %d ê°œ\n", fragNum);
+    printf("[ë°ì´í„°]   ì»¤ë²„ë¦¬ì§€         : %.1f ë°°  (= M*L / N)\n",
+           (double)(fragNum * fragLength) / refLength);
+    printf("[ì—ëŸ¬]     ì„¤ì • ì—ëŸ¬ìœ¨      : %d %%\n", ERROR_RATE_PERCENT);
+    printf("[ì—ëŸ¬]     ì‹¤ì œ ì£¼ì… ë¯¸ìŠ¤ë§¤ì¹˜: %d / %ld bp (%.2f %%)\n",
+           injectedErrors, totalBases, totalBases > 0 ? (100.0 * injectedErrors / totalBases) : 0.0);
+    printf("[íŒŒë¼ë¯¸í„°] ì¸ë±ìŠ¤ K-mer     : %d\n", K_MER);
+    printf("[íŒŒë¼ë¯¸í„°] De Bruijn k      : %d\n", DBG_K);
+    printf("[íŒŒë¼ë¯¸í„°] ì—ëŸ¬ í•„í„° ì„ê³„ë¹ˆë„: %d (ì´í•˜ k-merëŠ” ì—ëŸ¬ë¡œ ì œê±°)\n", DBG_MIN_FREQ);
+    printf("====================================================\n\n");
+
+    // ê³µí†µ ì „ì²˜ë¦¬: ì¸ë±ìŠ¤ + í™
+    CountingIndex* countingIndex = buildCountingIndex(frags);
+    MaxHeap* seedHeap = (countingIndex != NULL) ? buildSeedHeap(countingIndex) : NULL;
+
+    if (countingIndex == NULL || seedHeap == NULL) {
+        printf("ì¸ë±ìŠ¤/í™ ìƒì„±ì— ì‹¤íŒ¨í–ˆìŠµë‹ˆë‹¤.\n");
+        freeMaxHeap(seedHeap);
+        freeCountingIndex(countingIndex);
+        for (int i = 0; i < fragNum; i++) free(frags[i]);
+        free(frags);
+        free(ref);
+        return 1;
+    }
+
+    printTopSeeds(seedHeap, 5);
+
+    // ===== [ë°©ì‹ 1] ê¸°ì¡´ greedy ì¡°ë¦½ (ë²¤ì¹˜ë§ˆí¬) =====
+    clock_t s1 = clock();
+    char* greedy = assembleReads(countingIndex, seedHeap, frags, MAX_MISMATCH);
+    double t1 = (double)(clock() - s1) / CLOCKS_PER_SEC;
+
+    // ===== [ë°©ì‹ 2] Consensus ë³´ì • ì¡°ë¦½ (ìš°ë¦¬ ê°œì„ ì•ˆ) =====
+    clock_t s2 = clock();
+    char* consensus = assembleConsensus(countingIndex, seedHeap, frags, MAX_MISMATCH);
+    double t2 = (double)(clock() - s2) / CLOCKS_PER_SEC;
+
+    double accGreedy = 0.0, accConsensus = 0.0;
+    if (greedy != NULL)
+        accGreedy = printPerformanceReport("ë°©ì‹1: ê¸°ì¡´ Greedy ì¡°ë¦½(ë²¤ì¹˜ë§ˆí¬)",
+                        ref, greedy, t1, calcMemory(countingIndex, seedHeap, strlen(greedy)));
+    if (consensus != NULL)
+        accConsensus = printPerformanceReport("ë°©ì‹2: De Bruijn Consensus ì¡°ë¦½(ê°œì„ ì•ˆ)",
+                        ref, consensus, t2, calcMemory(countingIndex, seedHeap, strlen(consensus)));
+
+    // ===== ë¹„êµ ìš”ì•½ (í•œëˆˆì— ë³´ê¸°) =====
+    printf("\n+++++++++++++ ë‘ ë°©ì‹ ë¹„êµ ìš”ì•½ (ì—ëŸ¬ìœ¨ %d%%) +++++++++++++\n", ERROR_RATE_PERCENT);
+    printf("              ë³µì›ìœ¨        ì†ë„(ì´ˆ)\n");
+    printf("  Greedy   : %6.2f %%     %.6f\n", accGreedy, t1);
+    printf("  Consensus: %6.2f %%     %.6f\n", accConsensus, t2);
+    printf("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++\n");
+    
+    // ë©”ëª¨ë¦¬ í•´ì œ
+    free(consensus);
+    free(greedy);
+    freeMaxHeap(seedHeap);
+    freeCountingIndex(countingIndex);
     for (int i = 0; i < fragNum; i++) free(frags[i]);
     free(frags);
     free(ref);

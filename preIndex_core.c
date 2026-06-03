@@ -1,0 +1,827 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "preIndex_core.h"
+
+static int charToBit(char c) {
+    switch (c) {
+        case 'A': return 0;
+        case 'C': return 1;
+        case 'G': return 2;
+        case 'T': return 3;
+    }
+
+    return 0;
+}
+
+static int* freqArray(char** frags) {
+    int* countArray = (int*)calloc(HASH_SIZE, sizeof(int));
+    if (countArray == NULL) return NULL;
+
+    int cut = (1 << (K_MER * 2)) - 1;
+
+    for (int i = 0; i < fragNum; i++) {
+        char* read = frags[i];
+        int currentHash = 0;
+
+        for (int j = 0; j < K_MER; j++) {
+            currentHash = (currentHash << 2) | charToBit(read[j]);
+        }
+        countArray[currentHash]++;
+
+        for (int j = K_MER; j < fragLength; j++) {
+            currentHash = ((currentHash << 2) | charToBit(read[j])) & cut;
+            countArray[currentHash]++;
+        }
+    }
+
+    return countArray;
+}
+
+static char bitToChar(int value) {
+    switch (value) {
+        case 0: return 'A';
+        case 1: return 'C';
+        case 2: return 'G';
+        case 3: return 'T';
+    }
+
+    return 'A';
+}
+
+void hashToKmer(int hash, char* out) {
+    for (int i = K_MER - 1; i >= 0; i--) {
+        out[i] = bitToChar(hash & 3);
+        hash >>= 2;
+    }
+    out[K_MER] = '\0';
+}
+
+CountingIndex* buildCountingIndex(char** frags) {
+    CountingIndex* index = (CountingIndex*)malloc(sizeof(CountingIndex));
+    if (index == NULL) return NULL;
+
+    index->countArray = freqArray(frags);
+    if (index->countArray == NULL) {
+        free(index);
+        return NULL;
+    }
+
+    index->totalKmers = fragNum * (fragLength - K_MER + 1);
+    index->prefixStart = (int*)malloc((HASH_SIZE + 1) * sizeof(int));
+    index->prefixEnd = (int*)malloc(HASH_SIZE * sizeof(int));
+    index->occurrences = (KmerOccurrence*)malloc(index->totalKmers * sizeof(KmerOccurrence));
+
+    if (index->prefixStart == NULL || index->prefixEnd == NULL || index->occurrences == NULL) {
+        free(index->occurrences);
+        free(index->prefixEnd);
+        free(index->prefixStart);
+        free(index->countArray);
+        free(index);
+        return NULL;
+    }
+
+    index->prefixStart[0] = 0;
+    for (int hash = 1; hash <= HASH_SIZE; hash++) {
+        index->prefixStart[hash] = index->prefixStart[hash - 1] + index->countArray[hash - 1];
+    }
+
+    for (int hash = 0; hash < HASH_SIZE; hash++) {
+        index->prefixEnd[hash] = index->prefixStart[hash] + index->countArray[hash];
+    }
+
+    int* currentOffset = (int*)calloc(HASH_SIZE, sizeof(int));
+    if (currentOffset == NULL) {
+        free(index->occurrences);
+        free(index->prefixEnd);
+        free(index->prefixStart);
+        free(index->countArray);
+        free(index);
+        return NULL;
+    }
+
+    int cut = (1 << (K_MER * 2)) - 1;
+
+    for (int readIndex = 0; readIndex < fragNum; readIndex++) {
+        char* read = frags[readIndex];
+        int currentHash = 0;
+
+        for (int j = 0; j < K_MER; j++) {
+            currentHash = (currentHash << 2) | charToBit(read[j]);
+        }
+
+        int firstPosition = index->prefixStart[currentHash] + currentOffset[currentHash];
+        index->occurrences[firstPosition].readIndex = readIndex;
+        index->occurrences[firstPosition].offset = 0;
+        currentOffset[currentHash]++;
+
+        for (int j = K_MER; j < fragLength; j++) {
+            currentHash = ((currentHash << 2) | charToBit(read[j])) & cut;
+
+            int offset = j - K_MER + 1;
+            int position = index->prefixStart[currentHash] + currentOffset[currentHash];
+
+            index->occurrences[position].readIndex = readIndex;
+            index->occurrences[position].offset = offset;
+            currentOffset[currentHash]++;
+        }
+    }
+
+    free(currentOffset);
+    return index;
+}
+
+void freeCountingIndex(CountingIndex* index) {
+    if (index == NULL) return;
+
+    free(index->occurrences);
+    free(index->prefixEnd);
+    free(index->prefixStart);
+    free(index->countArray);
+    free(index);
+}
+
+static void swapSeed(SeedCandidate* a, SeedCandidate* b) {
+    SeedCandidate temp = *a;
+    *a = *b;
+    *b = temp;
+}
+
+static void heapifyUp(MaxHeap* heap, int index) {
+    while (index > 0) {
+        int parent = (index - 1) / 2;
+
+        if (heap->data[parent].frequency >= heap->data[index].frequency) break;
+
+        swapSeed(&heap->data[parent], &heap->data[index]);
+        index = parent;
+    }
+}
+
+static void heapifyDown(MaxHeap* heap, int index) {
+    while (1) {
+        int left = index * 2 + 1;
+        int right = index * 2 + 2;
+        int largest = index;
+
+        if (left < heap->size && heap->data[left].frequency > heap->data[largest].frequency) {
+            largest = left;
+        }
+
+        if (right < heap->size && heap->data[right].frequency > heap->data[largest].frequency) {
+            largest = right;
+        }
+
+        if (largest == index) break;
+
+        swapSeed(&heap->data[index], &heap->data[largest]);
+        index = largest;
+    }
+}
+
+MaxHeap* buildSeedHeap(const CountingIndex* index) {
+    MaxHeap* heap = (MaxHeap*)malloc(sizeof(MaxHeap));
+    if (heap == NULL) return NULL;
+
+    heap->data = (SeedCandidate*)malloc(HASH_SIZE * sizeof(SeedCandidate));
+    heap->size = 0;
+    heap->capacity = HASH_SIZE;
+
+    if (heap->data == NULL) {
+        free(heap);
+        return NULL;
+    }
+
+    for (int hash = 0; hash < HASH_SIZE; hash++) {
+        if (index->countArray[hash] == 0) continue;
+
+        heap->data[heap->size].hash = hash;
+        heap->data[heap->size].frequency = index->countArray[hash];
+        heapifyUp(heap, heap->size);
+        heap->size++;
+    }
+
+    return heap;
+}
+
+SeedCandidate extractMax(MaxHeap* heap) {
+    SeedCandidate empty = {-1, 0};
+    if (heap == NULL || heap->size == 0) return empty;
+
+    SeedCandidate top = heap->data[0];
+    heap->size--;
+    heap->data[0] = heap->data[heap->size];
+    heapifyDown(heap, 0);
+
+    return top;
+}
+
+void freeMaxHeap(MaxHeap* heap) {
+    if (heap == NULL) return;
+
+    free(heap->data);
+    free(heap);
+}
+
+void printCountingIndex(const CountingIndex* index, char** frags) {
+    char kmer[K_MER + 1];
+
+    printf("=== 단계 3: Counting Sort 기반 압축 인덱스 ===\n");
+    printf("총 k-mer 개수: %d\n", index->totalKmers);
+
+    for (int hash = 0; hash < HASH_SIZE; hash++) {
+        if (index->countArray[hash] == 0) continue;
+
+        hashToKmer(hash, kmer);
+        printf("해시 [%2d] k-mer [%s] -> 시작 %2d, 끝 %2d, 빈도 %d\n",
+               hash,
+               kmer,
+               index->prefixStart[hash],
+               index->prefixEnd[hash] - 1,
+               index->countArray[hash]);
+
+        for (int pos = index->prefixStart[hash]; pos < index->prefixEnd[hash]; pos++) {
+            KmerOccurrence occurrence = index->occurrences[pos];
+            printf("    압축배열[%2d] = read %d, offset %d, 조각 내 k-mer %.*s\n",
+                   pos,
+                   occurrence.readIndex,
+                   occurrence.offset,
+                   K_MER,
+                   frags[occurrence.readIndex] + occurrence.offset);
+        }
+    }
+
+    printf("\n");
+}
+
+void printTopSeeds(MaxHeap* heap, int topN) {
+    char kmer[K_MER + 1];
+
+    printf("=== 단계 4: Max Heap 기반 상위 시드 추출 ===\n");
+    for (int rank = 1; rank <= topN && heap->size > 0; rank++) {
+        SeedCandidate candidate = extractMax(heap);
+        hashToKmer(candidate.hash, kmer);
+        printf("Top %d Seed -> hash %2d, k-mer [%s], 빈도 %d\n",
+               rank,
+               candidate.hash,
+               kmer,
+               candidate.frequency);
+    }
+    printf("\n");
+}
+
+// ===============================================================
+// 메모리 사용량 측정 (malloc 크기 합산, 간단 방식)
+// ===============================================================
+size_t countingIndexMemory(const CountingIndex* index) {
+    if (index == NULL) return 0;
+
+    size_t bytes = sizeof(CountingIndex);
+    bytes += (size_t)HASH_SIZE * sizeof(int);                     // countArray
+    bytes += (size_t)(HASH_SIZE + 1) * sizeof(int);              // prefixStart
+    bytes += (size_t)HASH_SIZE * sizeof(int);                     // prefixEnd
+    bytes += (size_t)index->totalKmers * sizeof(KmerOccurrence);  // occurrences
+    return bytes;
+}
+
+size_t maxHeapMemory(const MaxHeap* heap) {
+    if (heap == NULL) return 0;
+    return sizeof(MaxHeap) + (size_t)heap->capacity * sizeof(SeedCandidate);
+}
+
+// ===============================================================
+// 5단계: 우선순위 기반 조립 (Seed-and-Extend, de novo)
+// ===============================================================
+
+// 두 조각의 오버랩 구간을 비교하며 mismatch 수를 센다 (조기 종료)
+int checkOverlapWithMismatch(const char* readSign, const char* targetRead, int overlapLen, int maxMismatch) {
+    int mismatches = 0;
+    for (int i = 0; i < overlapLen; i++) {
+        if (readSign[i] != targetRead[i]) {
+            mismatches++;
+            if (mismatches > maxMismatch) return -1;   // 허용치 초과 시 즉시 실패
+        }
+    }
+    return mismatches;
+}
+
+// MaxHeap의 고빈도 시드를 시작점으로, CountingIndex를 활용해 양방향으로 조각을 이어붙인다.
+// 🌟 맨 뒤에 'int maxMismatch' 매개변수를 추가합니다.
+char* assembleReads(const CountingIndex* index, MaxHeap* heap, char** frags, int maxMismatch) {
+    if (index == NULL || frags == NULL || heap == NULL) return NULL;
+
+    // 최대 2배 크기로 버퍼 할당
+    char* assembled = (char*)malloc(fragNum * fragLength * 2 + 1);
+    if (assembled == NULL) return NULL;
+
+    int* used = (int*)calloc(fragNum, sizeof(int));
+    if (used == NULL) { free(assembled); return NULL; }
+
+    // 1단계: 가장 빈도가 높은 Top Seed 하나를 추출하여 조립의 시작점으로 삼음
+    SeedCandidate topSeed = extractMax(heap);
+    if (topSeed.frequency == 0) {
+        free(assembled); free(used); return NULL;
+    }
+
+    int pStart = index->prefixStart[topSeed.hash];
+    int pEnd = index->prefixEnd[topSeed.hash];
+    int firstFragIdx = index->occurrences[pStart].readIndex;
+
+    strcpy(assembled, frags[firstFragIdx]);
+    used[firstFragIdx] = 1;
+
+    // 조립 가상의 윈도우 포인터
+    char* assembledStart = assembled;
+    int assembledLen = fragLength;
+
+    // 🌟 이 자리에 있던 기존 'int maxMismatch = MAX_MISMATCH;'는 매개변수와 이름이 겹치므로 삭제합니다.
+
+    // ... (아래 나머지 로직은 그대로 유지) ...
+
+    // int maxMismatch = MAX_MISMATCH;
+
+    // 2단계: 오른쪽(Right) 확장 방향 조립
+    while (1) {
+        int bestOverlap = -1;
+        int bestFragIdx = -1;
+        double bestErrorRate = 1.0; // 🌟 후보군 중 최저 에러율을 추적하기 위한 변수
+
+        // 조립된 서열의 맨 뒤 K_MER를 해시 키로 사용
+        int currentHash = 0;
+        char* tailKmer = assembledStart + assembledLen - K_MER;
+        for (int i = 0; i < K_MER; i++) {
+            currentHash = (currentHash << 2) | charToBit(tailKmer[i]);
+        }
+
+        int pStart = index->prefixStart[currentHash];
+        int pEnd = index->prefixEnd[currentHash];
+
+        for (int p = pStart; p < pEnd; p++) {
+            int i = index->occurrences[p].readIndex;
+            if (used[i]) continue;
+
+            char* target = frags[i];
+            
+            // 🌟 오버랩이 긴 것부터 탐색
+            for (int len = fragLength; len >= MIN_OVERLAP; len--) {
+                if (assembledLen < len) continue;
+                
+                char* assembledTail = assembledStart + assembledLen - len;
+                int mismatch = checkOverlapWithMismatch(assembledTail, target, len, maxMismatch);
+
+                if (mismatch != -1) {
+                    double currentErrorRate = (double)mismatch / len; // 현재 겹침의 미스매치 비율
+                    
+                    // 🌟 [핵심 변경] break를 하지 않고, 더 높은 기준을 만족하는지 검사합니다.
+                    // 1) 겹침 길이가 기존 최적 오버랩보다 더 길거나
+                    // 2) 겹침 길이는 같은데 에러율(미스매치율)이 더 낮다면 최적 후보를 갱신합니다.
+                    if (len > bestOverlap || (len == bestOverlap && currentErrorRate < bestErrorRate)) {
+                        bestOverlap = len;
+                        bestFragIdx = i;
+                        bestErrorRate = currentErrorRate;
+                    }
+                }
+            }
+        }
+
+        // 더 이상 매칭되는 리드가 없으면 종료
+        if (bestFragIdx == -1) break;
+
+        // 찾은 최적의 리드를 오른쪽에 이어붙임
+        strcat(assembledStart, frags[bestFragIdx] + bestOverlap);
+        used[bestFragIdx] = 1;
+        assembledLen += (fragLength - bestOverlap);
+    }
+
+    // 3단계: 왼쪽(Left) 확장 방향 조립
+    while (1) {
+        int bestOverlap = -1;
+        int bestFragIdx = -1;
+        double bestErrorRate = 1.0; // 🌟 좌측 확장용 최저 에러율 추적 변수
+
+        // 조립된 서열의 맨 앞 K_MER를 해시 키로 사용
+        int currentHash = 0;
+        char* headKmer = assembledStart;
+        for (int i = 0; i < K_MER; i++) {
+            currentHash = (currentHash << 2) | charToBit(headKmer[i]);
+        }
+
+        int pStart = index->prefixStart[currentHash];
+        int pEnd = index->prefixEnd[currentHash];
+
+        for (int p = pStart; p < pEnd; p++) {
+            int i = index->occurrences[p].readIndex;
+            if (used[i]) continue;
+
+            char* target = frags[i];
+            int offset = index->occurrences[p].offset;
+
+            // 왼쪽 조립은 K-mer 오프셋을 기준으로 겹침 길이를 바로 유추
+            int len = fragLength - offset;
+            if (len < MIN_OVERLAP) continue;
+
+            int mismatch = checkOverlapWithMismatch(target, assembledStart, len, maxMismatch);
+
+            if (mismatch != -1) {
+                double currentErrorRate = (double)mismatch / len;
+                
+                // 🌟 [핵심 변경] 마찬가지로 전수조사를 통해 최적의 좌측 오버랩 조각을 채택
+                if (len > bestOverlap || (len == bestOverlap && currentErrorRate < bestErrorRate)) {
+                    bestOverlap = len;
+                    bestFragIdx = i;
+                    bestErrorRate = currentErrorRate;
+                }
+            }
+        }
+
+        if (bestFragIdx == -1) break;
+
+        // 왼쪽 확장은 새로운 메모리 영역을 앞으로 당겨 쓰기 위해 포인터 조절 필요
+        int extension = fragLength - bestOverlap;
+        char* newStart = assembledStart - extension;
+        
+        // 데이터 카피 시 오버랩 영역 안전 복사
+        memmove(newStart, frags[bestFragIdx], fragLength);
+        
+        // 기존 조립 서열의 오버랩 이후 데이터를 다시 얹어줌 (덮어쓰기 방지)
+        memmove(newStart + fragLength, assembledStart + bestOverlap, assembledLen - bestOverlap);
+
+        assembledStart = newStart;
+        used[bestFragIdx] = 1;
+        assembledLen += extension;
+        assembledStart[assembledLen] = '\0';
+    }
+
+    free(used);
+    
+    // 최종 결과 반환 시, 왼쪽 확장으로 인해 마이너스로 당겨진 실제 시작 주소 문자열을 새 메모리에 할당해 리턴
+    char* finalResult = (char*)malloc(assembledLen + 1);
+    if (finalResult != NULL) {
+        strcpy(finalResult, assembledStart);
+    }
+    free(assembled);
+
+    return finalResult;
+}
+
+// ===============================================================
+// 5단계+: De Bruijn 그래프 기반 Consensus 조립 (에러 내성)
+// ---------------------------------------------------------------
+// 단순 greedy는 "리드를 통째로 이어붙여" 에러가 있으면 시드/겹침이 깨져
+// 조립이 끊긴다. 여기서는 리드를 작은 k-mer(DBG_K)로 잘게 쪼개 그래프로 본다.
+//
+//   원리(커버리지로 에러를 이긴다):
+//     - 올바른 k-mer는 여러 리드에 반복 등장 → 빈도 높음.
+//     - 에러난 k-mer는 한두 번만 등장 → 빈도 낮음(DBG_MIN_FREQ 이하).
+//     => 저빈도 k-mer를 버리면 '에러가 자동으로 걸러진' k-mer 집합이 남는다.
+//
+//   조립:
+//     - k-mer 두 개가 (k-1)글자만큼 겹치면 한 글자씩 이어진다(De Bruijn 간선).
+//     - 고빈도 시작 k-mer에서 출발해, 다음 글자(A/C/G/T) 중 빈도가 가장 높은
+//       k-mer로 한 칸씩 전진하며 서열을 늘린다(= 위치별 다수결 consensus).
+//     - 양방향(오른쪽/왼쪽)으로 확장해 원본을 복원한다.
+// ===============================================================
+
+// DBG_K 길이 k-mer 빈도표 생성 (리드를 슬라이딩하며 카운트). 에러 필터의 기반.
+static int* buildDbgFreq(char** frags) {
+    int* freq = (int*)calloc((size_t)DBG_HASH_SIZE, sizeof(int));
+    if (freq == NULL) return NULL;
+    int cut = (1 << (DBG_K * 2)) - 1;
+
+    for (int i = 0; i < fragNum; i++) {
+        char* read = frags[i];
+        int h = 0;
+        for (int j = 0; j < DBG_K; j++)
+            h = (h << 2) | charToBit(read[j]);
+        freq[h]++;
+        for (int j = DBG_K; j < fragLength; j++) {
+            h = ((h << 2) | charToBit(read[j])) & cut;
+            freq[h]++;
+        }
+    }
+    return freq;
+}
+
+// [변형 A] DBG_K 빈도표로부터 Max Heap을 구성한다.
+// 4단계에서 쓰던 MaxHeap/SeedCandidate 자료구조와 heapifyUp을 그대로 재사용해,
+// "가장 신뢰도(빈도) 높은 k-mer를 우선순위 큐로 관리"하는 4단계의 역할을
+// 5단계 조립의 시작점 선택에 직접 연결한다. (1~5단계 파이프라인 일관성 확보)
+// seedList: 실제 등장한 k-mer 해시 목록, seedCount: 그 개수.
+static MaxHeap* buildSeedHeapFromFreq(const int* freq, const int* seedList, int seedCount) {
+    MaxHeap* heap = (MaxHeap*)malloc(sizeof(MaxHeap));
+    if (heap == NULL) return NULL;
+
+    heap->data = (SeedCandidate*)malloc((size_t)(seedCount > 0 ? seedCount : 1) * sizeof(SeedCandidate));
+    heap->size = 0;
+    heap->capacity = seedCount;
+    if (heap->data == NULL) { free(heap); return NULL; }
+
+    // 등장한 k-mer만 힙에 삽입 (DBG_HASH_SIZE 전체가 아니라 실제 등장분만 → 효율적)
+    for (int i = 0; i < seedCount; i++) {
+        int h = seedList[i];
+        heap->data[heap->size].hash = h;
+        heap->data[heap->size].frequency = freq[h];
+        heapifyUp(heap, heap->size);   // 4단계의 heapifyUp 재사용
+        heap->size++;
+    }
+    return heap;
+}
+
+// 현재 k-mer(curHash)의 뒤에 A/C/G/T를 붙여 만든 4개의 다음 k-mer 중
+// 빈도가 가장 높은(>=DBG_MIN_FREQ) 것을 선택. 반환: 추가된 염기 비트(0~3), 없으면 -1.
+static int bestNext(const int* freq, int curHash, int cut) {
+    int bestBase = -1, bestFreq = DBG_MIN_FREQ;   // 임계값 이하(에러)는 무시
+    for (int b = 0; b < 4; b++) {
+        int nextHash = ((curHash << 2) | b) & cut;
+        if (freq[nextHash] > bestFreq) { bestFreq = freq[nextHash]; bestBase = b; }
+    }
+    return bestBase;
+}
+
+// 현재 k-mer(curHash)의 앞에 A/C/G/T를 붙여 만든 4개의 이전 k-mer 중 최고 빈도 선택.
+static int bestPrev(const int* freq, int curHash, int highBitShift) {
+    int bestBase = -1, bestFreq = DBG_MIN_FREQ;
+    for (int b = 0; b < 4; b++) {
+        int prevHash = (curHash >> 2) | (b << highBitShift);
+        if (freq[prevHash] > bestFreq) { bestFreq = freq[prevHash]; bestBase = b; }
+    }
+    return bestBase;
+}
+
+// 시드 k-mer 하나에서 양방향으로 greedy 확장해 contig 하나를 만든다.
+// 매 칸 가장 빈도 높은 다음 k-mer로 전진(=위치별 다수결). visited는 반복서열에서의
+// 무한루프 차단용. 한 번 방문한 k-mer를 다시 만나면 멈춘다.
+static char* growContig(const int* freq, int seedHash, char* visited, int* outLen) {
+    int cut = (1 << (DBG_K * 2)) - 1;
+    int highBitShift = (DBG_K - 1) * 2;
+
+    int maxLen = refLength * 2 + fragLength + 16;
+    char* buf = (char*)calloc((size_t)maxLen, 1);
+    if (buf == NULL) { *outLen = 0; return NULL; }
+    char* start = buf + maxLen / 2;
+
+    { int h = seedHash; for (int i = DBG_K - 1; i >= 0; i--) { start[i] = "ACGT"[h & 3]; h >>= 2; } }
+    int len = DBG_K;
+    visited[seedHash] = 1;
+
+    // 오른쪽 확장
+    int curHash = seedHash;
+    while ((start - buf) + len < maxLen - 1) {
+        int b = bestNext(freq, curHash, cut);
+        if (b < 0) break;
+        int nextHash = ((curHash << 2) | b) & cut;
+        if (visited[nextHash]) break;
+        start[len++] = "ACGT"[b];
+        curHash = nextHash;
+        visited[nextHash] = 1;
+    }
+
+    // 왼쪽 확장
+    curHash = seedHash;
+    while (start - buf > 1) {
+        int b = bestPrev(freq, curHash, highBitShift);
+        if (b < 0) break;
+        int prevHash = (curHash >> 2) | (b << highBitShift);
+        if (visited[prevHash]) break;
+        start--; len++;
+        start[0] = "ACGT"[b];
+        curHash = prevHash;
+        visited[prevHash] = 1;
+    }
+
+    char* contig = (char*)malloc((size_t)len + 1);
+    if (contig) { memcpy(contig, start, len); contig[len] = '\0'; }
+    free(buf);
+    *outLen = (contig != NULL) ? len : 0;
+    return contig;
+}
+
+// 두 contig가 (a의 접미부 == b의 접두부)로 겹치는 최대 길이를 찾는다.
+// DBG_K-1 이상 겹쳐야 De Bruijn 상 실제 인접으로 인정. 없으면 0.
+static int contigOverlap(const char* a, int aLen, const char* b, int bLen) {
+    int maxOv = (aLen < bLen) ? aLen : bLen;
+    for (int ov = maxOv; ov >= DBG_K - 1; ov--) {
+        if (memcmp(a + aLen - ov, b, ov) == 0) return ov;
+    }
+    return 0;
+}
+
+// [리드 다리 병합용] 문자열 hay 안에서 길이 needleLen인 needle이 처음 나오는 위치.
+// 못 찾으면 -1. (작은 데이터라 단순 검색으로 충분)
+static int findSub(const char* hay, int hayLen, const char* needle, int needleLen) {
+    if (needleLen <= 0 || needleLen > hayLen) return -1;
+    for (int i = 0; i <= hayLen - needleLen; i++)
+        if (memcmp(hay + i, needle, needleLen) == 0) return i;
+    return -1;
+}
+
+// 리드 다리(read bridging): contig A의 '끝'과 contig B의 '시작'을 동시에 품은
+// 원본 리드를 찾아, 그 리드의 중간 구간(틈)으로 A와 B를 한 줄로 잇는다.
+// 커버리지 구멍으로 그래프가 끊겨 겹침 병합이 안 될 때, 틈을 가로지르는 리드로 메운다.
+//
+// aTail: A의 마지막 ANCHOR글자, bHead: B의 처음 ANCHOR글자.
+// 성공 시 A와 B 사이에 들어갈 '연결 구간(리드에서 aTail 끝 ~ bHead 시작 사이)'을
+// gapOut에 복사하고 그 길이를 반환. 실패 시 -1.
+// (A의 aTail과 B의 bHead는 결과에 이미 있으므로 그 사이만 채우면 됨)
+static int findBridge(char** frags, const char* aTail, const char* bHead,
+                      int anchor, char* gapOut, int gapCap) {
+    for (int r = 0; r < fragNum; r++) {
+        char* read = frags[r];
+        int posA = findSub(read, fragLength, aTail, anchor);
+        if (posA < 0) continue;
+        int afterA = posA + anchor;                       // 리드에서 aTail 바로 뒤
+        int posB = findSub(read + afterA, fragLength - afterA, bHead, anchor);
+        if (posB < 0) continue;                            // 같은 리드에 B 시작이 뒤따라 나오나
+        posB += afterA;                                    // 리드 내 절대 위치로 보정
+        int gapLen = posB - afterA;                        // A끝과 B시작 사이 틈 길이
+        if (gapLen < 0 || gapLen >= gapCap) continue;
+        if (gapLen > 0) memcpy(gapOut, read + afterA, gapLen);
+        return gapLen;                                     // 0이면 A끝과 B시작이 바로 붙음
+    }
+    return -1;
+}
+
+char* assembleConsensus(const CountingIndex* index, const MaxHeap* heap, char** frags, int maxMismatch) {
+    (void)index; (void)heap; (void)maxMismatch;   // 이 방식은 DBG_K 빈도표만 사용
+
+    int* freq = buildDbgFreq(frags);
+    if (freq == NULL) return NULL;
+
+    char* visited = (char*)calloc((size_t)DBG_HASH_SIZE, 1);
+    if (visited == NULL) { free(freq); return NULL; }
+
+    // [0] 실제 등장한 k-mer 해시만 수집해 빈도 내림차순으로 정렬한다.
+    // (DBG_HASH_SIZE는 4^15≈10억이라 매번 전체 스캔하면 매우 느리다. 실제 등장한
+    //  k-mer는 리드 길이×개수 수준뿐이므로 그 목록만 다루면 시드 선택이 빨라진다.)
+    int cap = fragNum * fragLength;
+    int* seedList = (int*)malloc((size_t)cap * sizeof(int));
+    int seedCount = 0;
+    {
+        int cutk = (1 << (DBG_K * 2)) - 1;
+        char* seen = (char*)calloc((size_t)DBG_HASH_SIZE, 1);   // 중복 수집 방지
+        for (int r = 0; r < fragNum && seen; r++) {
+            char* read = frags[r];
+            int h = 0;
+            for (int j = 0; j < DBG_K; j++) h = (h << 2) | charToBit(read[j]);
+            for (int j = DBG_K - 1; j < fragLength; j++) {
+                if (j >= DBG_K) h = ((h << 2) | charToBit(read[j])) & cutk;
+                if (!seen[h] && freq[h] > DBG_MIN_FREQ) { seen[h] = 1; seedList[seedCount++] = h; }
+            }
+        }
+        if (seen) free(seen);
+    }
+    // [변형 A] 4단계 Max Heap 자료구조로 시드 우선순위를 관리한다.
+    // 기존엔 qsort로 전체 정렬했지만, "신뢰도(빈도) 높은 시드부터 하나씩 꺼내는"
+    // 우리 용도엔 Max Heap(extractMax)이 자료구조적으로 더 적합하다.
+    // 이로써 4단계(Max Heap)가 5단계(조립 시작점 선택)에 실제로 연결된다.
+    MaxHeap* seedHeap = buildSeedHeapFromFreq(freq, seedList, seedCount);
+    free(seedList);
+    if (seedHeap == NULL) { free(visited); free(freq); return NULL; }
+
+    // [1] Max Heap에서 신뢰도 높은 시드부터 추출해 contig를 확장·수집한다.
+    const int MAX_CONTIGS = 256;
+    char** contigs = (char**)malloc(MAX_CONTIGS * sizeof(char*));
+    int* clens = (int*)malloc(MAX_CONTIGS * sizeof(int));
+    int nContigs = 0;
+
+    while (nContigs < MAX_CONTIGS && seedHeap->size > 0) {
+        SeedCandidate top = extractMax(seedHeap);   // 4단계 extractMax 재사용
+        int seedHash = top.hash;
+        if (seedHash < 0) break;
+        if (visited[seedHash]) continue;            // 이미 다른 contig가 흡수한 시드
+
+        int len = 0;
+        char* contig = growContig(freq, seedHash, visited, &len);
+        if (contig == NULL) break;
+        if (len >= DBG_K) {
+            contigs[nContigs] = contig;
+            clens[nContigs] = len;
+            nContigs++;
+        } else {
+            free(contig);
+        }
+    }
+
+    freeMaxHeap(seedHeap);   // 4단계 freeMaxHeap 재사용
+    free(visited);
+    free(freq);
+
+    if (nContigs == 0) { free(contigs); free(clens); return NULL; }
+
+    // [2] contig 병합: 가장 긴 것을 뼈대로, 끝-시작이 겹치는 조각을 반복적으로 이어붙인다.
+    // 가장 긴 contig를 시작 결과로 선택
+    int bestIdx = 0;
+    for (int i = 1; i < nContigs; i++) if (clens[i] > clens[bestIdx]) bestIdx = i;
+
+    int resCap = refLength * 2 + 16;
+    char* result = (char*)malloc((size_t)resCap);
+    int resLen = clens[bestIdx];
+    memcpy(result, contigs[bestIdx], resLen);
+    result[resLen] = '\0';
+
+    char* mergedFlag = (char*)calloc(nContigs, 1);
+    mergedFlag[bestIdx] = 1;
+
+    // 더 이상 붙일 게 없을 때까지 반복: 겹침 병합 + 리드 다리 병합을 함께 시도.
+    int anchor = DBG_K;                       // 리드와 contig 끝/시작을 맞출 기준 길이
+    char* gap = (char*)malloc((size_t)fragLength + 1);
+    int progress = 1;
+    while (progress) {
+        progress = 0;
+        for (int i = 0; i < nContigs; i++) {
+            if (mergedFlag[i]) continue;
+            char* c = contigs[i];
+            int cl = clens[i];
+
+            // (1) 겹침 병합 — (결과 뒤 + contig 앞)
+            int ovR = contigOverlap(result, resLen, c, cl);
+            if (ovR >= DBG_K - 1 && resLen + (cl - ovR) < resCap) {
+                memcpy(result + resLen, c + ovR, cl - ovR);
+                resLen += cl - ovR;
+                result[resLen] = '\0';
+                mergedFlag[i] = 1; progress = 1; continue;
+            }
+            // (1) 겹침 병합 — (contig 뒤 + 결과 앞)
+            int ovL = contigOverlap(c, cl, result, resLen);
+            if (ovL >= DBG_K - 1 && resLen + (cl - ovL) < resCap) {
+                int add = cl - ovL;
+                memmove(result + add, result, resLen + 1);
+                memcpy(result, c, add);
+                resLen += add;
+                mergedFlag[i] = 1; progress = 1; continue;
+            }
+
+            // (2) 리드 다리 병합 — 겹침이 없을 때(커버리지 구멍) 틈을 리드로 메움.
+            // aTail/bHead(anchor)는 각각 result와 contig에 이미 들어있고, gap은 그 '사이'
+            // 틈이므로, 결합은 (이미 있는 쪽) + gap + (상대 contig 전체) 형태가 된다.
+            if (resLen >= anchor && cl >= anchor && gap != NULL) {
+                // 방향 A: [결과] + gap + [contig 전체]   (결과 끝 anchor 다음에 contig 시작 anchor가 오는 리드)
+                int gLen = findBridge(frags, result + resLen - anchor, c, anchor, gap, fragLength + 1);
+                if (gLen >= 0 && resLen + gLen + cl < resCap) {
+                    if (gLen > 0) { memcpy(result + resLen, gap, gLen); resLen += gLen; }
+                    memcpy(result + resLen, c, cl);          // contig 전체를 붙임
+                    resLen += cl;
+                    result[resLen] = '\0';
+                    mergedFlag[i] = 1; progress = 1; continue;
+                }
+                // 방향 B: [contig 전체] + gap + [결과]    (contig 끝 anchor 다음에 결과 시작 anchor가 오는 리드)
+                gLen = findBridge(frags, c + cl - anchor, result, anchor, gap, fragLength + 1);
+                if (gLen >= 0 && cl + gLen + resLen < resCap) {
+                    int add = cl + gLen;                     // 앞에 새로 들어갈 길이
+                    memmove(result + add, result, resLen + 1);
+                    memcpy(result, c, cl);                    // contig 전체
+                    if (gLen > 0) memcpy(result + cl, gap, gLen);  // 그 뒤 틈
+                    resLen += add;
+                    mergedFlag[i] = 1; progress = 1; continue;
+                }
+            }
+        }
+    }
+    free(gap);
+
+    for (int i = 0; i < nContigs; i++) free(contigs[i]);
+    free(contigs); free(clens); free(mergedFlag);
+    return result;
+}
+
+
+// ===============================================================
+// 성능 리포트: 정확도(최적 오프셋 정렬) + 속도 + 메모리
+// ===============================================================
+double printPerformanceReport(const char* label, const char* originalRef,
+                              const char* assembledRef, double duration, size_t memoryBytes) {
+    if (originalRef == NULL || assembledRef == NULL) return 0.0;
+
+    int N = (int)strlen(originalRef);
+    int A = (int)strlen(assembledRef);
+
+    // [정확도 측정] de novo 조립은 시작 위치/길이가 원본과 어긋나기 때문에
+    // 0번부터 단순 비교하면 실력을 과소평가한다. 그래서 assembled를 original 위에서
+    // 한 칸씩 밀어가며(offset) 일치 글자 수가 최대가 되는 위치를 찾아 그 값으로 채점한다.
+    int bestMatches = 0;
+    int bestOffset = 0;
+    for (int d = -(A - 1); d <= N - 1; d++) {
+        int matches = 0;
+        for (int i = 0; i < A; i++) {
+            int j = i + d;
+            if (j >= 0 && j < N && assembledRef[i] == originalRef[j]) matches++;
+        }
+        if (matches > bestMatches) { bestMatches = matches; bestOffset = d; }
+    }
+
+    double accuracy = (N > 0) ? (100.0 * bestMatches / N) : 0.0;
+    double covLen   = (N > 0) ? (100.0 * A / N) : 0.0;   // 조립이 원본 길이를 얼마나 펴냈나
+
+    printf("\n================ [%s] 성능 분석 리포트 ================\n", label);
+    printf("[정확도] 원본 복원율 : %6.2f %%   (일치 %d / 원본 %d bp)\n", accuracy, bestMatches, N);
+    printf("[정확도] 조립 길이비 : %6.2f %%   (조립 %d bp, 정렬 오프셋 %d)\n", covLen, A, bestOffset);
+    printf("[속도]   알고리즘 시간: %.6f 초\n", duration);
+    printf("[메모리] 사용량      : %zu bytes (%.2f MB)\n", memoryBytes, memoryBytes / (1024.0 * 1024.0));
+    if (N <= 200) {
+        printf("----------------------------------------------------\n");
+        printf("원본: %s\n조립: %s\n", originalRef, assembledRef);
+    }
+    printf("==========================================================\n");
+    return accuracy;
+}
