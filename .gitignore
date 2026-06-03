@@ -11,3 +11,5 @@ graph_*.csv
 .understand-anything/
 search_*.csv
 trivial_search
+simple
+trivial
