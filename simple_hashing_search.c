@@ -3,158 +3,177 @@
 #include <stdlib.h>
 #include <time.h>
 
-#define refLength 100   // 원본 염기서열 길이
-#define fragLength 10   // 조각 길이
-#define fragNum 10      // 조각 개수
+// ===== 데이터 생성 파라미터 (조립 코드 preIndex_core.h와 통일) =====
+#define refLength   20000                                  // 원본 게놈 길이 (N)
+#define COVERAGE    60                                     // 목표 커버리지 (배수)
+#define fragLength  100                                    // 리드 길이 (L)
+#define fragNum     ((refLength * COVERAGE) / fragLength)  // 리드 개수 (M)
+#define ERROR_RATE_PERCENT 1                               // 시퀀싱 에러율(%) — 0이면 에러 없음
+#define MISMATCH_THRESHOLD 2                               // 매핑 시 허용 미스매치 수
+#define K_MER_SIZE 4                                       // 시드로 쓸 k-mer 길이
+
+// OS와 무관하게 충분히 큰 난수 (Windows의 작은 RAND_MAX 보정)
+static long bigRand(void) {
+    return ((long)rand() << 15) | (long)rand();
+}
 
 char* makeRef() {
     char basis[4] = { 'A', 'T', 'C', 'G' };
-
-    // 염기 서열 저장하기 위한 배열 동적 할당 (+1은 문자열 종료 문자 '\0'를 위해)
     char* ref = (char*)malloc((refLength + 1) * sizeof(char));
-    srand(time(NULL));
-
-    for (int i = 0; i < refLength; i++) {
-        int index = rand() % 4;
-        ref[i] = basis[index];
-    }
-    ref[refLength] = '\0'; // 문자열 종료 문자 추가
-
+    if (ref == NULL) return NULL;
+    srand((unsigned int)time(NULL));
+    for (int i = 0; i < refLength; i++) ref[i] = basis[rand() % 4];
+    ref[refLength] = '\0';
     return ref;
 }
 
-char** makeFrag(char* ref) {
-    char** frags = (char**)malloc(fragNum * sizeof(char*));     // 조각들을 저장하기 위한 2차원 배열을 동적으로 할당
+static char mutateBase(char original) {
+    char basis[4] = { 'A', 'C', 'G', 'T' };
+    char c;
+    do { c = basis[rand() % 4]; } while (c == original);
+    return c;
+}
 
+char** makeFrag(char* ref, int* trueStart) {
+    char** frags = (char**)malloc(fragNum * sizeof(char*));
+    if (frags == NULL) return NULL;
     for (int i = 0; i < fragNum; i++) {
-        frags[i] = (char*)malloc((fragLength + 1) * sizeof(char));     // 각 조각을 저장하기 위한 배열 동적 할당 (+1은 문자열 종료 문자 '\0'를 위해)
-
-        int startIndex = rand() % (refLength - fragLength + 1);     // 원본 염기서열에서 조각을 시작할 랜덤한 인덱스 생성
+        frags[i] = (char*)malloc((fragLength + 1) * sizeof(char));
+        int startIndex = bigRand() % (refLength - fragLength + 1);
+        if (trueStart) trueStart[i] = startIndex;
         for (int j = 0; j < fragLength; j++) {
-            frags[i][j] = ref[startIndex + j];     // 원본 염기서열에서 조각을 추출하여 frags 배열에 저장
+            char base = ref[startIndex + j];
+            if (ERROR_RATE_PERCENT > 0 && (rand() % 100) < ERROR_RATE_PERCENT)
+                base = mutateBase(base);
+            frags[i][j] = base;
         }
-        frags[i][fragLength] = '\0';      // 문자열 종료 문자 추가
+        frags[i][fragLength] = '\0';
     }
-
     return frags;
 }
 
-// 문자를 0~3 숫자로 변환 (A, C, G, T 기반 2비트 인코딩)
+// 문자를 0~3 숫자로 변환 (A,C,G,T 2비트 인코딩)
 int char_to_int(char c) {
     if (c == 'A') return 0;
     if (c == 'C') return 1;
     if (c == 'G') return 2;
     if (c == 'T') return 3;
-    return 0; // 예외 처리용 기본값
+    return 0;
 }
 
-// k-mer에 대한 연속 해시값 계산
+// k-mer 해시값 (Rolling Hash, 비트 연산)
 int get_hash(const char* str, int k) {
     int hash = 0;
-    for (int i = 0; i < k; i++) {
-        hash = (hash << 2) | char_to_int(str[i]);
-    }
+    for (int i = 0; i < k; i++) hash = (hash << 2) | char_to_int(str[i]);
     return hash;
 }
 
-// 기본 해싱 알고리즘 (Rolling Hash + Prefix Sum 기반 정적 배열)
-void hashing_search(const char* genome, const char* read, int k, int threshold) {
+// ──────────────────────────────────────────────────────────────
+// 해시 인덱스 매핑: 게놈을 k-mer 인덱스(Counting Sort)로 만들어,
+// read의 첫 k-mer를 가진 후보 위치에서만 미스매치 검사 → 완전탐색보다 빠름.
+// 반환: read가 매칭된 위치(미스매치 최소). 없으면 -1.
+// ※ 게놈 인덱스는 read마다 새로 만들지 않고 main에서 한 번만 만들어 넘긴다.
+// ──────────────────────────────────────────────────────────────
+typedef struct {
+    int* count;        // k-mer 빈도
+    int* prefix_sum;   // 누적합(시작 좌표)
+    int* index_array;  // k-mer별 게놈 위치 목록
+    int hash_size;
+} GenomeIndex;
+
+GenomeIndex* build_index(const char* genome, int k) {
     int g_len = strlen(genome);
-    int r_len = strlen(read);
-
-    // k-mer 길이가 read 길이보다 길면 탐색 불가
-    if (k > r_len) return;
-
-    // 해시 크기 계산 (4^k)
     int hash_size = 1 << (2 * k);
 
-    // 빈도수 저장을 위한 배열 할당 및 초기화 (0으로 세팅)
-    int* count = (int*)calloc(hash_size + 1, sizeof(int));
+    GenomeIndex* gi = (GenomeIndex*)malloc(sizeof(GenomeIndex));
+    gi->hash_size = hash_size;
+    gi->count = (int*)calloc(hash_size + 1, sizeof(int));
+    gi->prefix_sum = (int*)calloc(hash_size + 1, sizeof(int));
 
-    // 단계 1: k-mer 빈도수 카운팅
-    for (int i = 0; i <= g_len - k; i++) {
-        int h = get_hash(genome + i, k);
-        count[h]++;
-    }
+    for (int i = 0; i <= g_len - k; i++) gi->count[get_hash(genome + i, k)]++;
+    for (int i = 1; i <= hash_size; i++)
+        gi->prefix_sum[i] = gi->prefix_sum[i - 1] + gi->count[i - 1];
 
-    // 단계 2: 누적합 (Prefix Sum) 계산을 통한 원본 인덱스 저장 좌표 산출
-    int* prefix_sum = (int*)calloc(hash_size + 1, sizeof(int));
-
-    for (int i = 1; i <= hash_size; i++) {
-        prefix_sum[i] = prefix_sum[i - 1] + count[i - 1];
-    }
-
-    // 단계 3: 정적 1차원 배열 할당 및 실제 위치(인덱스) 기록
     int total_kmers = g_len - k + 1;
-    int* index_array = (int*)malloc(total_kmers * sizeof(int));
-    int* current_offset = (int*)calloc(hash_size, sizeof(int)); // 위치 중복 방지용 오프셋
-
+    gi->index_array = (int*)malloc(total_kmers * sizeof(int));
+    int* cur = (int*)calloc(hash_size, sizeof(int));
     for (int i = 0; i <= g_len - k; i++) {
         int h = get_hash(genome + i, k);
-        int pos = prefix_sum[h] + current_offset[h];
-        index_array[pos] = i;
-        current_offset[h]++;
+        gi->index_array[gi->prefix_sum[h] + cur[h]] = i;
+        cur[h]++;
     }
+    free(cur);
+    return gi;
+}
 
-    // 단계 4: 탐색 수행 (read의 첫 번째 k-mer를 시드로 사용)
+void free_index(GenomeIndex* gi) {
+    if (!gi) return;
+    free(gi->count); free(gi->prefix_sum); free(gi->index_array); free(gi);
+}
+
+int hashing_search(const char* genome, const GenomeIndex* gi,
+                   const char* read, int k, int threshold) {
+    int g_len = strlen(genome);
+    int r_len = strlen(read);
+    if (k > r_len) return -1;
+
     int read_hash = get_hash(read, k);
-    int start = prefix_sum[read_hash]; // 해당 해시값이 모여있는 시작점
-    int count_match = count[read_hash]; // 해당 해시값의 총 개수
+    int start = gi->prefix_sum[read_hash];
+    int count_match = gi->count[read_hash];
 
-    // 일치하는 시드 위치에서만 미스매치 검사 진행
+    int bestPos = -1, bestMismatch = threshold + 1;
     for (int i = 0; i < count_match; i++) {
-        int g_idx = index_array[start + i];
-
-        // 탐색 범위가 원본 길이를 초과하면 무시
+        int g_idx = gi->index_array[start + i];
         if (g_idx + r_len > g_len) continue;
-
         int mismatch = 0;
-
         for (int j = 0; j < r_len; j++) {
             if (genome[g_idx + j] != read[j]) {
                 mismatch++;
-                if (mismatch > threshold) break;
+                if (mismatch >= bestMismatch) break;
             }
         }
-
-        // 최종 조건 통과 시 출력
-        if (mismatch <= threshold) {
-            printf("Match at index %d (mismatches: %d)\n", g_idx, mismatch);
-        }
+        if (mismatch < bestMismatch) { bestMismatch = mismatch; bestPos = g_idx; }
     }
-
-    // 동적 할당 메모리 해제 (누수 방지)
-    free(count);
-    free(prefix_sum);
-    free(index_array);
-    free(current_offset);
+    return (bestMismatch <= threshold) ? bestPos : -1;
 }
 
-int main() {
-
-    // 테스트용 시퀀스 무작위 생성
+int main(void) {
+    int* trueStart = (int*)malloc(fragNum * sizeof(int));
     char* genome = makeRef();
-    char** reads = makeFrag(genome);
-
-    int mismatch_threshold = 1; // 1개까지 불일치 허용
-    int k_mer_size = 4;         // 부분 서열(k-mer) 길이는 4로 설정
-
-    printf("원본 서열: %s\n\n", genome);
-
-    // 10개의 조각에 대해 탐색 실행
-    for (int i = 0; i < fragNum; i++) {
-        printf("--- [%d번째 조각: %s] Hashing Search ---\n", i + 1, reads[i]);
-        hashing_search(genome, reads[i], k_mer_size, mismatch_threshold);
-        printf("\n");
+    char** reads = (genome != NULL) ? makeFrag(genome, trueStart) : NULL;
+    if (genome == NULL || reads == NULL || trueStart == NULL) {
+        printf("데이터 생성 실패\n"); return 1;
     }
 
-    // 메모리 해제
-    for (int i = 0; i < fragNum; i++) {
-        free(reads[i]); // 개별 조각 해제
-    }
-    free(reads);  // 조각 포인터 배열 해제
-    free(genome); // 원본 서열 해제
+    printf("========== Simple Hash 인덱스 매핑 (벤치마크) ==========\n");
+    printf("[데이터] N=%d, L=%d, M=%d, 커버리지=%.1f배, 에러율=%d%%, k-mer=%d\n",
+           refLength, fragLength, fragNum,
+           (double)(fragNum * fragLength) / refLength, ERROR_RATE_PERCENT, K_MER_SIZE);
 
+    // ===== 측정: 인덱스 구축 + 탐색 시간 + 매핑 정확도 =====
+    int correct = 0, found = 0;
+    clock_t s = clock();
+    GenomeIndex* gi = build_index(genome, K_MER_SIZE);   // 게놈 인덱스 1회 구축
+    for (int i = 0; i < fragNum; i++) {
+        int pos = hashing_search(genome, gi, reads[i], K_MER_SIZE, MISMATCH_THRESHOLD);
+        if (pos != -1) {
+            found++;
+            if (pos == trueStart[i]) correct++;
+        }
+    }
+    double duration = (double)(clock() - s) / CLOCKS_PER_SEC;
+    free_index(gi);
+
+    double mapRate = 100.0 * found / fragNum;
+    double accRate = 100.0 * correct / fragNum;
+
+    printf("\n================ [Simple Hash] 성능 분석 리포트 ================\n");
+    printf("[정확도] 매핑 성공률 : %6.2f %%   (%d / %d 리드)\n", mapRate, found, fragNum);
+    printf("[정확도] 위치 정확도 : %6.2f %%   (정답 위치 %d / %d)\n", accRate, correct, fragNum);
+    printf("[속도]   탐색 시간   : %.6f 초  (인덱스 구축 포함)\n", duration);
+    printf("==============================================================\n");
+
+    for (int i = 0; i < fragNum; i++) free(reads[i]);
+    free(reads); free(genome); free(trueStart);
     return 0;
-
 }
