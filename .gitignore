@@ -13,3 +13,7 @@ search_*.csv
 trivial_search
 simple
 trivial
+# 로컬 전용 문서/산출물 (보고서·발표 작성용, 깃 추적 불필요)
+*.txt
+.DS_Store
+build_assemble

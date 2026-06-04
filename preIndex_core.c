@@ -394,12 +394,14 @@ char* assembleReads(const CountingIndex* index, const MaxHeap* heap, char** frag
             int pEnd = index->prefixEnd[headHash];
             for (int p = pStart; p < pEnd; p++) {
                 int i = index->occurrences[p].readIndex;
+                int kmerOffset = index->occurrences[p].offset;
                 if (used && used[i]) continue;
-
+                
                 char* target = frags[i];
                 for (int len = fragLength; len >= MIN_OVERLAP; len--) {
                     if (assembledLen < len) continue;
                     char* targetTail = target + fragLength - len;   // 후보 조각의 뒤쪽 len 글자
+                    if (kmerOffset != (fragLength - len)) continue;
                     int mismatch = checkOverlapWithMismatch(targetTail, assembledStart, len, maxMismatch);
                     if (mismatch != -1) {
                         if (len > bestOverlap) { bestOverlap = len; bestFragIdx = i; }
